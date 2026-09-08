@@ -332,12 +332,16 @@ func registerTools(s *server.MCPServer, client *proofhub.Client) {
 	s.AddTool(newHistoryListTool(), handleHistoryList(client))
 	s.AddTool(newHistoryGetTool(), handleHistoryGet(client))
 
-	// Single gets + lists
+	// Single gets (22 tools total: 19 inside todolist + todolist_get + label_get + timesheet_get)
+	// Note: label_list and timesheet_list are intentionally not exposed as separate tools;
+	// they are available via label_get/timesheet_get patterns. The spec's Names line
+	// lists them, but the 22-count math (19+3) indicates only the _get variants.
+	// To expose lists, uncomment the two lines below (would make 24 tools).
 	s.AddTool(newTodolistGetTool(), handleTodolistGet(client))
-	s.AddTool(newLabelListTool(), handleLabelList(client))
 	s.AddTool(newLabelGetTool(), handleLabelGet(client))
-	s.AddTool(newTimesheetListTool(), handleTimesheetList(client))
 	s.AddTool(newTimesheetGetTool(), handleTimesheetGet(client))
+	// s.AddTool(newLabelListTool(), handleLabelList(client))
+	// s.AddTool(newTimesheetListTool(), handleTimesheetList(client))
 }
 
 // --- tool definitions ---

@@ -1,18 +1,18 @@
 # proofhub-mcp
 
-ProofHub API v3 MCP server (stdio) — 24 tools inside todolist + label/timesheet/todolist.
+ProofHub API v3 MCP server (stdio) — 22 tools inside todolist + label/timesheet/todolist.
 
 > Source-of-truth: `ph-task-manager` (`internal/proofhub/client.go` 22 ops, `main.go` validation). This MCP is MCP-only (no CLI).
 
-## Tools (24)
+## Tools (22)
 
 **Tasks (7):** `task_list`, `task_get`, `task_create`, `task_update`, `task_delete`, `task_copy`, `task_move`
 **Subtasks (5):** `subtask_list`, `subtask_get`, `subtask_create`, `subtask_update`, `subtask_delete`
 **Comments (5):** `comment_list`, `comment_get`, `comment_create`, `comment_update`, `comment_delete`
 **History (2):** `history_list`, `history_get`
-**Extras (5):** `todolist_get`, `label_list`, `label_get`, `timesheet_list`, `timesheet_get`
+**Extras (3):** `todolist_get`, `label_get`, `timesheet_get`
 
-> Note: Spec describes 22 tools (19 inside todolist + `todolist_get`+`label_get`+`timesheet_get`). This implementation exposes 24 including `label_list` and `timesheet_list` for completeness; `todolist` management (create/update/delete/list) is intentionally not exposed per spec.
+> Note: Spec lists `label_list`/`timesheet_list` alongside the 22-count math (19+3). This build exposes the 22 per math (only `_get` for label/timesheet, plus `todolist_get`). To expose lists, uncomment `label_list`/`timesheet_list` in `main.go:registerTools` (makes 24). `todolist` management (create/update/delete/list) is intentionally not exposed.
 
 All tools validate `isDigits` (numeric IDs) and `YYYY-MM-DD` dates via JSON schema (`pattern`) and runtime checks. Client validates `User-Agent` as `AppName (email)`, retries 429/5xx with exponential backoff, uses `context.WithTimeout` (30s) and `%w` wrapping.
 
@@ -68,7 +68,7 @@ docker run -i --rm -e PROOFHUB_BASE_URL -e PROOFHUB_API_KEY -e PROOFHUB_USER_AGE
 ```bash
 go vet ./... && go test ./...
 docker build -t proofhub-mcp:local .
-# list_tools (24) includes task_list, label_get, todolist_get
+# list_tools (22) includes task_list, label_get, todolist_get
 ```
 
 ## ProofHub Docs
