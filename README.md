@@ -21,6 +21,15 @@ MCP_HTTP_PORT=8080   # port for http, default 8080
 
 ENV validation runs at startup — lowercase errors without leaking secrets (`proofhub_project_id is required and must be digits, got ""`).
 
+### How to get your API key
+
+1. Log in to your ProofHub account (`https://yourcompany.proofhub.com`).
+2. Click your profile picture/avatar in the top-right corner.
+3. Open **Profile** → **API Access** menu.
+4. Copy the API key (used as `X-API-KEY` / `PROOFHUB_API_KEY`). Keep it secret — never commit it to git.
+
+> Tip: On some ProofHub versions you need to click the profile picture 5 times to reveal the API key field.
+
 ## Tools (24) — single todolist scope
 
 All tools are scoped to `PROOFHUB_PROJECT_ID`/`PROOFHUB_TODOLIST_ID` from ENV. No `project_id`/`todolist_id` params in input — the agent only needs `task_id`, `subtask_id`, etc.
