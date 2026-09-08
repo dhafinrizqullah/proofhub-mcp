@@ -7,4 +7,5 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/proofhub-mcp .
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=builder /bin/proofhub-mcp /bin/proofhub-mcp
+EXPOSE 8080
 ENTRYPOINT ["/bin/proofhub-mcp"]

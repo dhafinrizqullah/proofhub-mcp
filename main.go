@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -15,22 +17,36 @@ import (
 	"github.com/dhafinrizqullah/proofhub-mcp/pkg/proofhub"
 )
 
-// version is set via ldflags.
 var version = "dev"
 
+type config struct {
+	baseURL    string
+	apiKey     string
+	userAgent  string
+	projectID  string
+	todolistID string
+	transport  string
+	httpPort   string
+}
+
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	client, err := newClientFromEnv()
+func run(args []string) error {
+	cfg, err := loadConfig(args)
 	if err != nil {
-		// Do not fail hard on missing env for MCP lifecycle; log to stderr and continue.
-		// Tools will return error if client is not configured.
-		fmt.Fprintf(os.Stderr, "warn: %v\n", err)
+		return err
+	}
+	if err := validateConfig(cfg); err != nil {
+		return err
+	}
+	client := proofhub.New(cfg.baseURL, cfg.apiKey, cfg.userAgent)
+	if err := client.Validate(); err != nil {
+		return fmt.Errorf("validate proofhub config: %w", err)
 	}
 
 	s := server.NewMCPServer(
@@ -40,46 +56,117 @@ func run() error {
 		server.WithRecovery(),
 	)
 
-	registerTools(s, client)
+	registerTools(s, client, cfg.projectID, cfg.todolistID)
 
-	if err := server.ServeStdio(s); err != nil {
-		return fmt.Errorf("serve stdio: %w", err)
+	switch cfg.transport {
+	case "http":
+		return serveHTTP(s, cfg.httpPort)
+	default:
+		if err := server.ServeStdio(s); err != nil {
+			return fmt.Errorf("serve stdio: %w", err)
+		}
+		return nil
+	}
+}
+
+func loadConfig(args []string) (*config, error) {
+	cfg := &config{
+		baseURL:    strings.TrimSpace(os.Getenv("PROOFHUB_BASE_URL")),
+		apiKey:     strings.TrimSpace(os.Getenv("PROOFHUB_API_KEY")),
+		userAgent:  strings.TrimSpace(os.Getenv("PROOFHUB_USER_AGENT")),
+		projectID:  strings.TrimSpace(os.Getenv("PROOFHUB_PROJECT_ID")),
+		todolistID: strings.TrimSpace(os.Getenv("PROOFHUB_TODOLIST_ID")),
+		transport:  strings.TrimSpace(os.Getenv("MCP_TRANSPORT")),
+		httpPort:   strings.TrimSpace(os.Getenv("MCP_HTTP_PORT")),
+	}
+	if cfg.transport == "" {
+		cfg.transport = "stdio"
+	}
+	if cfg.httpPort == "" {
+		cfg.httpPort = "8080"
+	}
+	if cfg.userAgent == "" {
+		cfg.userAgent = "proofhub-mcp (dev@example.com)"
+	}
+
+	fs := flag.NewFlagSet("proofhub-mcp", flag.ContinueOnError)
+	fs.StringVar(&cfg.transport, "transport", cfg.transport, "transport: stdio or http")
+	fs.StringVar(&cfg.httpPort, "http-port", cfg.httpPort, "http port when transport=http")
+	// Also allow --transport and --http-port via args, but also support env already.
+	// Parse only known flags, ignore unknown to allow MCP inspector args.
+	// Use flag.NFlag to detect if provided.
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	// Normalize transport
+	cfg.transport = strings.ToLower(strings.TrimSpace(cfg.transport))
+	if cfg.transport != "stdio" && cfg.transport != "http" {
+		return nil, fmt.Errorf("invalid mcp_transport %q: want stdio or http", cfg.transport)
+	}
+	if cfg.httpPort != "" {
+		if _, err := strconv.Atoi(cfg.httpPort); err != nil {
+			return nil, fmt.Errorf("invalid mcp_http_port %q: want numeric port", cfg.httpPort)
+		}
+	}
+	// Re-read env for project/todolist if flags didn't override (flags don't cover them)
+	// Allow --project-id and --todolist-id as flags for local testing
+	var flagProject, flagTodolist string
+	fs2 := flag.NewFlagSet("extra", flag.ContinueOnError)
+	fs2.StringVar(&flagProject, "project-id", "", "")
+	fs2.StringVar(&flagTodolist, "todolist-id", "", "")
+	_ = fs2.Parse(args)
+	if flagProject != "" {
+		cfg.projectID = strings.TrimSpace(flagProject)
+	}
+	if flagTodolist != "" {
+		cfg.todolistID = strings.TrimSpace(flagTodolist)
+	}
+	return cfg, nil
+}
+
+func validateConfig(cfg *config) error {
+	if strings.TrimSpace(cfg.baseURL) == "" {
+		return fmt.Errorf("proofhub_base_url is required")
+	}
+	if strings.TrimSpace(cfg.apiKey) == "" {
+		return fmt.Errorf("proofhub_api_key is required")
+	}
+	if !isDigits(cfg.projectID) {
+		return fmt.Errorf("proofhub_project_id is required and must be digits, got %q", cfg.projectID)
+	}
+	if !isDigits(cfg.todolistID) {
+		return fmt.Errorf("proofhub_todolist_id is required and must be digits, got %q", cfg.todolistID)
+	}
+	// User-Agent validation is done via proofhub.Client.Validate, but also check format here for fail fast
+	if cfg.userAgent != "" {
+		// Use same pattern as client
+		if !strings.Contains(cfg.userAgent, " (") || !strings.Contains(cfg.userAgent, "@") {
+			return fmt.Errorf("user-agent must look like %q, got %q", "AppName (name@example.com)", cfg.userAgent)
+		}
 	}
 	return nil
 }
 
-func newClientFromEnv() (*proofhub.Client, error) {
-	baseURL := strings.TrimSpace(os.Getenv("PROOFHUB_BASE_URL"))
-	apiKey := strings.TrimSpace(os.Getenv("PROOFHUB_API_KEY"))
-	userAgent := strings.TrimSpace(os.Getenv("PROOFHUB_USER_AGENT"))
-	if userAgent == "" {
-		userAgent = os.Getenv("PROOFHUB_USER_AGENT")
+func serveHTTP(s *server.MCPServer, port string) error {
+	httpServer := server.NewStreamableHTTPServer(s)
+	addr := ":" + port
+	fmt.Fprintf(os.Stderr, "proofhub-mcp http listening on %s/mcp (transport=http)\n", addr)
+	// Use custom mux to ensure /mcp endpoint is correct
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", httpServer)
+	// Also handle root for health
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
-	if userAgent == "" {
-		userAgent = "proofhub-mcp (dev@example.com)"
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("http serve: %w", err)
 	}
-	// Allow PROOFHUB_API_KEY and PROOFHUB_BASE_URL to be required only when tools are called.
-	// Validate early if provided.
-	c := proofhub.New(baseURL, apiKey, userAgent)
-	// Don't validate if empty here; let handlers return meaningful errors.
-	if baseURL != "" || apiKey != "" {
-		if err := c.Validate(); err != nil {
-			return nil, fmt.Errorf("validate proofhub config: %w", err)
-		}
-	}
-	return c, nil
-}
-
-func mustClient(c *proofhub.Client) (*proofhub.Client, error) {
-	if c == nil {
-		return nil, fmt.Errorf("proofhub client not initialized")
-	}
-	// Re-read env in case it changed, but prefer existing client.
-	// Ensure Validate at call time.
-	if err := c.Validate(); err != nil {
-		return nil, fmt.Errorf("validate proofhub client: %w", err)
-	}
-	return c, nil
+	return nil
 }
 
 // --- validation helpers ---
@@ -106,16 +193,6 @@ func validateDate(s string) error {
 	return nil
 }
 
-func validateRequiredDigits(name, v string) error {
-	if strings.TrimSpace(v) == "" {
-		return fmt.Errorf("%s is required", name)
-	}
-	if !isDigits(v) {
-		return fmt.Errorf("invalid %s %q: want numeric id", name, v)
-	}
-	return nil
-}
-
 func jsonResult(v any) (*mcp.CallToolResult, error) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -131,24 +208,8 @@ func errorResult(msg string, err error) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultError(msg), nil
 }
 
-// withTimeout creates a context with 30s timeout for API calls.
 func withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, 30*time.Second)
-}
-
-func getString(req mcp.CallToolRequest, key string, required bool) (string, error) {
-	v, err := req.RequireString(key)
-	if err != nil {
-		if !required {
-			// Try optional get
-			if s := req.GetString(key, ""); s != "" {
-				return s, nil
-			}
-			return "", nil
-		}
-		return "", err
-	}
-	return strings.TrimSpace(v), nil
 }
 
 func getOptionalString(req mcp.CallToolRequest, key string) string {
@@ -156,7 +217,6 @@ func getOptionalString(req mcp.CallToolRequest, key string) string {
 }
 
 func getOptionalInt(req mcp.CallToolRequest, key string) (*int, error) {
-	// mcp-go stores numbers as float64 via JSON
 	args := req.GetArguments()
 	val, ok := args[key]
 	if !ok || val == nil {
@@ -183,41 +243,6 @@ func getOptionalInt(req mcp.CallToolRequest, key string) (*int, error) {
 			return nil, nil
 		}
 		n, err := strconv.Atoi(v)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s %q: want integer", key, v)
-		}
-		return &n, nil
-	default:
-		return nil, fmt.Errorf("invalid %s type %T", key, val)
-	}
-}
-
-func getOptionalInt64(req mcp.CallToolRequest, key string) (*int64, error) {
-	args := req.GetArguments()
-	val, ok := args[key]
-	if !ok || val == nil {
-		return nil, nil
-	}
-	switch v := val.(type) {
-	case float64:
-		n := int64(v)
-		return &n, nil
-	case int:
-		n := int64(v)
-		return &n, nil
-	case int64:
-		return &v, nil
-	case json.Number:
-		n, err := v.Int64()
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s: %w", key, err)
-		}
-		return &n, nil
-	case string:
-		if strings.TrimSpace(v) == "" {
-			return nil, nil
-		}
-		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("invalid %s %q: want integer", key, v)
 		}
@@ -279,7 +304,6 @@ func getInt64Slice(req mcp.CallToolRequest, key string) ([]int64, error) {
 		}
 		return out, nil
 	case string:
-		// Allow comma-separated string for convenience
 		if strings.TrimSpace(v) == "" {
 			return nil, nil
 		}
@@ -302,99 +326,91 @@ func getInt64Slice(req mcp.CallToolRequest, key string) ([]int64, error) {
 	}
 }
 
-// --- tool registration ---
-
-func registerTools(s *server.MCPServer, client *proofhub.Client) {
-	// Tasks
-	s.AddTool(newTaskListTool(), handleTaskList(client))
-	s.AddTool(newTaskGetTool(), handleTaskGet(client))
-	s.AddTool(newTaskCreateTool(), handleTaskCreate(client))
-	s.AddTool(newTaskUpdateTool(), handleTaskUpdate(client))
-	s.AddTool(newTaskDeleteTool(), handleTaskDelete(client))
-	s.AddTool(newTaskCopyTool(), handleTaskCopy(client))
-	s.AddTool(newTaskMoveTool(), handleTaskMove(client))
-
-	// Subtasks
-	s.AddTool(newSubtaskListTool(), handleSubtaskList(client))
-	s.AddTool(newSubtaskGetTool(), handleSubtaskGet(client))
-	s.AddTool(newSubtaskCreateTool(), handleSubtaskCreate(client))
-	s.AddTool(newSubtaskUpdateTool(), handleSubtaskUpdate(client))
-	s.AddTool(newSubtaskDeleteTool(), handleSubtaskDelete(client))
-
-	// Comments
-	s.AddTool(newCommentListTool(), handleCommentList(client))
-	s.AddTool(newCommentGetTool(), handleCommentGet(client))
-	s.AddTool(newCommentCreateTool(), handleCommentCreate(client))
-	s.AddTool(newCommentUpdateTool(), handleCommentUpdate(client))
-	s.AddTool(newCommentDeleteTool(), handleCommentDelete(client))
-
-	// History
-	s.AddTool(newHistoryListTool(), handleHistoryList(client))
-	s.AddTool(newHistoryGetTool(), handleHistoryGet(client))
-
-	// Single gets (22 tools total: 19 inside todolist + todolist_get + label_get + timesheet_get)
-	// Note: label_list and timesheet_list are intentionally not exposed as separate tools;
-	// they are available via label_get/timesheet_get patterns. The spec's Names line
-	// lists them, but the 22-count math (19+3) indicates only the _get variants.
-	// To expose lists, uncomment the two lines below (would make 24 tools).
-	s.AddTool(newTodolistGetTool(), handleTodolistGet(client))
-	s.AddTool(newLabelGetTool(), handleLabelGet(client))
-	s.AddTool(newTimesheetGetTool(), handleTimesheetGet(client))
-	// s.AddTool(newLabelListTool(), handleLabelList(client))
-	// s.AddTool(newTimesheetListTool(), handleTimesheetList(client))
+func hasArg(req mcp.CallToolRequest, key string) bool {
+	args := req.GetArguments()
+	_, ok := args[key]
+	return ok
 }
 
-// --- tool definitions ---
+func mustClient(c *proofhub.Client) (*proofhub.Client, error) {
+	if c == nil {
+		return nil, fmt.Errorf("proofhub client not initialized")
+	}
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("validate proofhub client: %w", err)
+	}
+	return c, nil
+}
+
+// --- tool registration ---
+// Scope: single todolist via ENV PROOFHUB_PROJECT_ID / PROOFHUB_TODOLIST_ID PROOFHUB_PROJECT_ID / PROOFHUB_TODOLIST_ID
+
+func registerTools(s *server.MCPServer, client *proofhub.Client, projectID, todolistID string) {
+	s.AddTool(newTaskListTool(), handleTaskList(client, projectID, todolistID))
+	s.AddTool(newTaskGetTool(), handleTaskGet(client, projectID, todolistID))
+	s.AddTool(newTaskCreateTool(), handleTaskCreate(client, projectID, todolistID))
+	s.AddTool(newTaskUpdateTool(), handleTaskUpdate(client, projectID, todolistID))
+	s.AddTool(newTaskDeleteTool(), handleTaskDelete(client, projectID, todolistID))
+	s.AddTool(newTaskCopyTool(), handleTaskCopy(client, projectID, todolistID))
+	s.AddTool(newTaskMoveTool(), handleTaskMove(client, projectID, todolistID))
+
+	s.AddTool(newSubtaskListTool(), handleSubtaskList(client, projectID, todolistID))
+	s.AddTool(newSubtaskGetTool(), handleSubtaskGet(client, projectID, todolistID))
+	s.AddTool(newSubtaskCreateTool(), handleSubtaskCreate(client, projectID, todolistID))
+	s.AddTool(newSubtaskUpdateTool(), handleSubtaskUpdate(client, projectID, todolistID))
+	s.AddTool(newSubtaskDeleteTool(), handleSubtaskDelete(client, projectID, todolistID))
+
+	s.AddTool(newCommentListTool(), handleCommentList(client, projectID, todolistID))
+	s.AddTool(newCommentGetTool(), handleCommentGet(client, projectID, todolistID))
+	s.AddTool(newCommentCreateTool(), handleCommentCreate(client, projectID, todolistID))
+	s.AddTool(newCommentUpdateTool(), handleCommentUpdate(client, projectID, todolistID))
+	s.AddTool(newCommentDeleteTool(), handleCommentDelete(client, projectID, todolistID))
+
+	s.AddTool(newHistoryListTool(), handleHistoryList(client, projectID, todolistID))
+	s.AddTool(newHistoryGetTool(), handleHistoryGet(client, projectID, todolistID))
+
+	s.AddTool(newTodolistGetTool(), handleTodolistGet(client, projectID, todolistID))
+	s.AddTool(newLabelListTool(), handleLabelList(client))
+	s.AddTool(newLabelGetTool(), handleLabelGet(client))
+	s.AddTool(newTimesheetListTool(), handleTimesheetList(client, projectID))
+	s.AddTool(newTimesheetGetTool(), handleTimesheetGet(client, projectID))
+}
+
+// --- tool definitions with full descriptions ---
 
 func newTaskListTool() mcp.Tool {
 	return mcp.NewTool("task_list",
-		mcp.WithDescription("List tasks in a todolist (ProofHub API v3 GET /projects/{project}/todolists/{list}/tasks)"),
-		mcp.WithString("project_id",
-			mcp.Required(),
-			mcp.Description("Project ID (digits only)"),
-			mcp.Pattern("^[0-9]+$"),
-		),
-		mcp.WithString("todolist_id",
-			mcp.Required(),
-			mcp.Description("Todolist (task list) ID (digits only)"),
-			mcp.Pattern("^[0-9]+$"),
-		),
+		mcp.WithDescription("List all tasks in the scoped todolist (PROOFHUB_PROJECT_ID/PROOFHUB_TODOLIST_ID). Returns array of tasks with id, ticket, title, status. No project/list input required — injected from ENV."),
 	)
 }
 
 func newTaskGetTool() mcp.Tool {
 	return mcp.NewTool("task_get",
-		mcp.WithDescription("Get a single task (GET /projects/{project}/todolists/{list}/tasks/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Description("Todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Get a single task in the scoped todolist (ENV). Requires task_id (digits). Returns full details: title, description, dates, progress, stage, assignees, labels."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID (digits only)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskCreateTool() mcp.Tool {
 	return mcp.NewTool("task_create",
-		mcp.WithDescription("Create a task in a todolist (POST /projects/{project}/todolists/{list}/tasks)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Description("Todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("title", mcp.Required(), mcp.Description("Task title")),
-		mcp.WithString("description", mcp.Description("Task description (HTML allowed)")),
+		mcp.WithDescription("Create a new task in the scoped todolist. Requires title; optional description, start/due dates, estimates, assignees, labels. Project/todolist injected from ENV, cannot create outside scope."),
+		mcp.WithString("title", mcp.Required(), mcp.Description("Task title (required)")),
+		mcp.WithString("description", mcp.Description("Task description (HTML allowed, e.g. <b>Label:</b> ...<br>)")),
 		mcp.WithString("start_date", mcp.Description("Start date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
 		mcp.WithString("due_date", mcp.Description("Due date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
-		mcp.WithNumber("estimated_hours", mcp.Description("Estimated hours")),
-		mcp.WithNumber("estimated_mins", mcp.Description("Estimated minutes")),
-		mcp.WithArray("assigned", mcp.Description("Assignee people IDs")),
-		mcp.WithArray("labels", mcp.Description("Label IDs")),
+		mcp.WithNumber("estimated_hours", mcp.Description("Estimated hours (integer)")),
+		mcp.WithNumber("estimated_mins", mcp.Description("Estimated minutes (integer)")),
+		mcp.WithArray("assigned", mcp.Description("Assignee people IDs (array of integers, e.g. [9526247227])")),
+		mcp.WithArray("labels", mcp.Description("Label IDs (array of integers, e.g. [5775379693,7273284338])")),
 	)
 }
 
 func newTaskUpdateTool() mcp.Tool {
 	return mcp.NewTool("task_update",
-		mcp.WithDescription("Update a task (PUT /projects/{project}/todolists/{list}/tasks/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Description("Todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Update a task in the scoped todolist. Requires task_id; optional: title, description, dates (YYYY-MM-DD), estimated_hours/mins, logged_hours/mins, percent_progress 0-100, assignees, labels, completed (bool), stage_id."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID (digits)"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Description("New title")),
-		mcp.WithString("description", mcp.Description("New description")),
+		mcp.WithString("description", mcp.Description("New description (HTML allowed)")),
 		mcp.WithString("start_date", mcp.Description("Start date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
 		mcp.WithString("due_date", mcp.Description("Due date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
 		mcp.WithNumber("estimated_hours", mcp.Description("Estimated hours")),
@@ -402,8 +418,8 @@ func newTaskUpdateTool() mcp.Tool {
 		mcp.WithNumber("logged_hours", mcp.Description("Logged hours")),
 		mcp.WithNumber("logged_mins", mcp.Description("Logged minutes")),
 		mcp.WithNumber("percent_progress", mcp.Description("Percent progress 0-100")),
-		mcp.WithArray("assigned", mcp.Description("Assignee IDs")),
-		mcp.WithArray("labels", mcp.Description("Label IDs")),
+		mcp.WithArray("assigned", mcp.Description("Assignee IDs (array)")),
+		mcp.WithArray("labels", mcp.Description("Label IDs (array)")),
 		mcp.WithBoolean("completed", mcp.Description("Mark completed true/false")),
 		mcp.WithString("stage_id", mcp.Description("Stage ID (digits)"), mcp.Pattern("^[0-9]+$")),
 	)
@@ -411,41 +427,31 @@ func newTaskUpdateTool() mcp.Tool {
 
 func newTaskDeleteTool() mcp.Tool {
 	return mcp.NewTool("task_delete",
-		mcp.WithDescription("Delete a task (DELETE /projects/{project}/todolists/{list}/tasks/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Description("Project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Description("Todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Delete a task inside the scoped todolist. Can only delete within the ENV-configured todolist."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID (digits)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskCopyTool() mcp.Tool {
 	return mcp.NewTool("task_copy",
-		mcp.WithDescription("Copy (duplicate) a task (POST /projects/{project}/todolists/{list}/tasks/{id} with copy_task)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Description("Source project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Description("Source todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID to copy"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("title", mcp.Description("Title for copied task")),
-		mcp.WithString("new_project_id", mcp.Description("Destination project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("new_todolist_id", mcp.Description("Destination todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("stage_id", mcp.Description("Stage ID for copied task"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithBoolean("copy_assignees", mcp.Description("Copy assignees")),
-		mcp.WithBoolean("copy_custom_fields", mcp.Description("Copy custom fields")),
-		mcp.WithBoolean("copy_dates", mcp.Description("Copy dates")),
-		mcp.WithBoolean("copy_comments", mcp.Description("Copy comments")),
+		mcp.WithDescription("Copy (duplicate) a task inside the scoped todolist. Creates duplicate in the same todolist (single-todolist scope). Optional: new title, stage_id, copy_assignees/custom_fields/dates/comments."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID to copy (digits)"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("title", mcp.Description("Title for copied task (optional, default 'Copy of ...')")),
+		mcp.WithString("stage_id", mcp.Description("Stage ID for copied task (digits)"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithBoolean("copy_assignees", mcp.Description("Copy assignees (default true)")),
+		mcp.WithBoolean("copy_custom_fields", mcp.Description("Copy custom fields (default true)")),
+		mcp.WithBoolean("copy_dates", mcp.Description("Copy dates (default true)")),
+		mcp.WithBoolean("copy_comments", mcp.Description("Copy comments (default true)")),
 	)
 }
 
 func newTaskMoveTool() mcp.Tool {
 	return mcp.NewTool("task_move",
-		mcp.WithDescription("Move a task (PUT /projects/{project}/todolists/{list}/tasks/{id} with move_task)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Description("Source project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Description("Source todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID to move"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Move a task inside the scoped todolist (single-todolist scope). Cannot move to another project/list. Optional: title, stage_id, move_people, copy_assignees/custom_fields, move_dates, proof_comment, copy_comments, completed."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID to move (digits)"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Description("New title (optional)")),
-		mcp.WithString("new_project_id", mcp.Description("Destination project ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("new_todolist_id", mcp.Description("Destination todolist ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("stage_id", mcp.Description("Stage ID"), mcp.Pattern("^[0-9]+$")),
-		mcp.WithBoolean("move_people", mcp.Description("Move people")),
+		mcp.WithString("stage_id", mcp.Description("Stage ID (digits)"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithBoolean("move_people", mcp.Description("Move people (default true)")),
 		mcp.WithBoolean("copy_assignees", mcp.Description("Copy assignees")),
 		mcp.WithBoolean("copy_custom_fields", mcp.Description("Copy custom fields")),
 		mcp.WithBoolean("move_dates", mcp.Description("Move dates")),
@@ -457,30 +463,24 @@ func newTaskMoveTool() mcp.Tool {
 
 func newSubtaskListTool() mcp.Tool {
 	return mcp.NewTool("subtask_list",
-		mcp.WithDescription("List subtasks for a task (GET .../tasks/{task}/subtasks)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$"), mcp.Description("Project ID")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$"), mcp.Description("Todolist ID")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$"), mcp.Description("Parent task ID")),
+		mcp.WithDescription("List subtasks under a task in the scoped todolist. Requires task_id. Returns array of subtasks."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID (digits)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newSubtaskGetTool() mcp.Tool {
 	return mcp.NewTool("subtask_get",
-		mcp.WithDescription("Get a subtask (GET .../subtasks/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("subtask_id", mcp.Required(), mcp.Pattern("^[0-9]+$"), mcp.Description("Subtask ID")),
+		mcp.WithDescription("Get a single subtask in the scoped todolist. Requires task_id and subtask_id."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("subtask_id", mcp.Required(), mcp.Description("Subtask ID"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newSubtaskCreateTool() mcp.Tool {
 	return mcp.NewTool("subtask_create",
-		mcp.WithDescription("Create a subtask (POST .../tasks/{task}/subtasks)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("title", mcp.Required(), mcp.Description("Subtask title")),
+		mcp.WithDescription("Create a new subtask under a task in the scoped todolist. Requires task_id and title; optional: description, start/due (YYYY-MM-DD), estimated_hours/mins, assignees, labels."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("title", mcp.Required(), mcp.Description("Subtask title (required)")),
 		mcp.WithString("description", mcp.Description("Description")),
 		mcp.WithString("start_date", mcp.Description("Start date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
 		mcp.WithString("due_date", mcp.Description("Due date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
@@ -493,11 +493,9 @@ func newSubtaskCreateTool() mcp.Tool {
 
 func newSubtaskUpdateTool() mcp.Tool {
 	return mcp.NewTool("subtask_update",
-		mcp.WithDescription("Update a subtask (PUT .../subtasks/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("subtask_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Update a subtask in the scoped todolist. Requires task_id and subtask_id; optional: title, description, dates, estimates, assignees, labels, completed."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("subtask_id", mcp.Required(), mcp.Description("Subtask ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Description("New title")),
 		mcp.WithString("description", mcp.Description("New description")),
 		mcp.WithString("start_date", mcp.Description("Start date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
@@ -506,146 +504,112 @@ func newSubtaskUpdateTool() mcp.Tool {
 		mcp.WithNumber("estimated_mins", mcp.Description("Estimated minutes")),
 		mcp.WithArray("assigned", mcp.Description("Assignee IDs")),
 		mcp.WithArray("labels", mcp.Description("Label IDs")),
-		mcp.WithBoolean("completed", mcp.Description("Completed flag")),
+		mcp.WithBoolean("completed", mcp.Description("Completed flag true/false")),
 	)
 }
 
 func newSubtaskDeleteTool() mcp.Tool {
 	return mcp.NewTool("subtask_delete",
-		mcp.WithDescription("Delete a subtask (DELETE .../subtasks/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("subtask_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Delete a subtask in the scoped todolist. Requires task_id and subtask_id. Scoped to ENV todolist only."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("subtask_id", mcp.Required(), mcp.Description("Subtask ID"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentListTool() mcp.Tool {
 	return mcp.NewTool("comment_list",
-		mcp.WithDescription("List comments for a task (GET .../comments)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("List comments on a task in the scoped todolist. Requires task_id. Returns array of comments with id, description, creator."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentGetTool() mcp.Tool {
 	return mcp.NewTool("comment_get",
-		mcp.WithDescription("Get a comment (GET .../comments/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("comment_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Get a single comment on a task in the scoped todolist. Requires task_id and comment_id."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("comment_id", mcp.Required(), mcp.Description("Comment ID"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentCreateTool() mcp.Tool {
 	return mcp.NewTool("comment_create",
-		mcp.WithDescription("Create a comment on a task (POST .../comments)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("description", mcp.Required(), mcp.Description("Comment text")),
+		mcp.WithDescription("Create a comment on a task in the scoped todolist. Requires task_id and description (comment text)."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("description", mcp.Required(), mcp.Description("Comment text (required)")),
 	)
 }
 
 func newCommentUpdateTool() mcp.Tool {
 	return mcp.NewTool("comment_update",
-		mcp.WithDescription("Update a comment (PUT .../comments/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("comment_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("description", mcp.Required(), mcp.Description("New comment text")),
+		mcp.WithDescription("Update a comment on a task in the scoped todolist. Requires task_id, comment_id, and new description."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("comment_id", mcp.Required(), mcp.Description("Comment ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("description", mcp.Required(), mcp.Description("New comment text (required)")),
 	)
 }
 
 func newCommentDeleteTool() mcp.Tool {
 	return mcp.NewTool("comment_delete",
-		mcp.WithDescription("Delete a comment (DELETE .../comments/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("comment_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Delete a comment on a task in the scoped todolist. Requires task_id and comment_id."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("comment_id", mcp.Required(), mcp.Description("Comment ID"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newHistoryListTool() mcp.Tool {
 	return mcp.NewTool("history_list",
-		mcp.WithDescription("List task history (GET .../history)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("List audit history for a task in the scoped todolist. Requires task_id. Returns activity history (updated, created, etc)."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newHistoryGetTool() mcp.Tool {
 	return mcp.NewTool("history_get",
-		mcp.WithDescription("Get task history detail (GET .../history/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("task_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("history_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Get a single history entry for a task in the scoped todolist. Requires task_id and history_id. Returns change content."),
+		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("history_id", mcp.Required(), mcp.Description("History ID"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTodolistGetTool() mcp.Tool {
 	return mcp.NewTool("todolist_get",
-		mcp.WithDescription("Get a todolist (GET /projects/{project}/todolists/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("todolist_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-	)
-}
-
-func newLabelGetTool() mcp.Tool {
-	return mcp.NewTool("label_get",
-		mcp.WithDescription("Get a label (GET /labels/{id})"),
-		mcp.WithString("label_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-	)
-}
-
-func newTimesheetGetTool() mcp.Tool {
-	return mcp.NewTool("timesheet_get",
-		mcp.WithDescription("Get a timesheet (GET /projects/{project}/timesheets/{id})"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
-		mcp.WithString("timesheet_id", mcp.Required(), mcp.Pattern("^[0-9]+$")),
+		mcp.WithDescription("Get the scoped todolist details (read-only). No input required — injected from PROOFHUB_PROJECT_ID/PROOFHUB_TODOLIST_ID. Returns title, privacy, archived, counts."),
 	)
 }
 
 func newLabelListTool() mcp.Tool {
 	return mcp.NewTool("label_list",
-		mcp.WithDescription("List labels (GET /labels)"),
+		mcp.WithDescription("List all labels (global, not scoped to todolist). No input required. Returns id, name, color."),
+	)
+}
+
+func newLabelGetTool() mcp.Tool {
+	return mcp.NewTool("label_get",
+		mcp.WithDescription("Get a single label by ID. Requires label_id (digits). Global lookup, not bound to ENV todolist."),
+		mcp.WithString("label_id", mcp.Required(), mcp.Description("Label ID (digits)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTimesheetListTool() mcp.Tool {
 	return mcp.NewTool("timesheet_list",
-		mcp.WithDescription("List timesheets for a project (GET /projects/{project}/timesheets)"),
-		mcp.WithString("project_id", mcp.Required(), mcp.Pattern("^[0-9]+$"), mcp.Description("Project ID")),
+		mcp.WithDescription("List timesheets in the scoped project (PROOFHUB_PROJECT_ID). No project input required — injected from ENV. Use to lookup timesheets before logging time."),
 	)
 }
 
-// --- handlers ---
+func newTimesheetGetTool() mcp.Tool {
+	return mcp.NewTool("timesheet_get",
+		mcp.WithDescription("Get a single timesheet in the scoped project. Requires timesheet_id (digits). Project injected from ENV."),
+		mcp.WithString("timesheet_id", mcp.Required(), mcp.Description("Timesheet ID (digits)"), mcp.Pattern("^[0-9]+$")),
+	)
+}
 
-func handleTaskList(client *proofhub.Client) server.ToolHandlerFunc {
+// --- handlers scoped to ENV project/todolist ---
+
+func handleTaskList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
-		}
-		projectID, err := req.RequireString("project_id")
-		if err != nil {
-			return errorResult("missing project_id", err)
-		}
-		todolistID, err := req.RequireString("todolist_id")
-		if err != nil {
-			return errorResult("missing todolist_id", err)
-		}
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -657,23 +621,18 @@ func handleTaskList(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTaskGet(client *proofhub.Client) server.ToolHandlerFunc {
+func handleTaskGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -685,20 +644,15 @@ func handleTaskGet(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTaskCreate(client *proofhub.Client) server.ToolHandlerFunc {
+func handleTaskCreate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		title, _ := req.RequireString("title")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
+		title, err := req.RequireString("title")
+		if err != nil {
+			return errorResult("missing title", err)
 		}
 		if strings.TrimSpace(title) == "" {
 			return errorResult("validation failed", fmt.Errorf("title is required"))
@@ -748,27 +702,22 @@ func handleTaskCreate(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTaskUpdate(client *proofhub.Client) server.ToolHandlerFunc {
+func handleTaskUpdate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		var payload proofhub.UpdateTaskRequest
-		if v := getOptionalString(req, "title"); v != "" || hasArg(req, "title") {
-			s := v
+		if hasArg(req, "title") {
+			s := getOptionalString(req, "title")
 			payload.Title = &s
 		}
 		if hasArg(req, "description") {
@@ -868,23 +817,18 @@ func handleTaskUpdate(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTaskDelete(client *proofhub.Client) server.ToolHandlerFunc {
+func handleTaskDelete(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -895,41 +839,22 @@ func handleTaskDelete(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTaskCopy(client *proofhub.Client) server.ToolHandlerFunc {
+func handleTaskCopy(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		var payload proofhub.CopyTaskRequest
 		if v := getOptionalString(req, "title"); v != "" {
 			payload.Title = v
-		}
-		if v := getOptionalString(req, "new_project_id"); v != "" {
-			if !isDigits(v) {
-				return errorResult("validation failed", fmt.Errorf("invalid new_project_id %q", v))
-			}
-			n, _ := strconv.ParseInt(v, 10, 64)
-			payload.Project = &n
-		}
-		if v := getOptionalString(req, "new_todolist_id"); v != "" {
-			if !isDigits(v) {
-				return errorResult("validation failed", fmt.Errorf("invalid new_todolist_id %q", v))
-			}
-			n, _ := strconv.ParseInt(v, 10, 64)
-			payload.ListID = &n
 		}
 		if v := getOptionalString(req, "stage_id"); v != "" {
 			if !isDigits(v) {
@@ -954,6 +879,8 @@ func handleTaskCopy(client *proofhub.Client) server.ToolHandlerFunc {
 			b, _ := getOptionalBool(req, "copy_comments")
 			payload.CopyComments = b
 		}
+		// Enforce single-todolist scope: copy within same project/todolist
+		// Still send copy_task id, but disallow new project/list
 		if n, err := strconv.ParseInt(taskID, 10, 64); err == nil {
 			payload.CopyTask = n
 		}
@@ -967,42 +894,23 @@ func handleTaskCopy(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTaskMove(client *proofhub.Client) server.ToolHandlerFunc {
+func handleTaskMove(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		var payload proofhub.MoveTaskRequest
 		if hasArg(req, "title") {
 			s := getOptionalString(req, "title")
 			payload.Title = &s
-		}
-		if v := getOptionalString(req, "new_project_id"); v != "" {
-			if !isDigits(v) {
-				return errorResult("validation failed", fmt.Errorf("invalid new_project_id %q", v))
-			}
-			n, _ := strconv.ParseInt(v, 10, 64)
-			payload.Project = &n
-		}
-		if v := getOptionalString(req, "new_todolist_id"); v != "" {
-			if !isDigits(v) {
-				return errorResult("validation failed", fmt.Errorf("invalid new_todolist_id %q", v))
-			}
-			n, _ := strconv.ParseInt(v, 10, 64)
-			payload.ListID = &n
 		}
 		if v := getOptionalString(req, "stage_id"); v != "" {
 			if !isDigits(v) {
@@ -1053,23 +961,18 @@ func handleTaskMove(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleSubtaskList(client *proofhub.Client) server.ToolHandlerFunc {
+func handleSubtaskList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1081,20 +984,22 @@ func handleSubtaskList(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleSubtaskGet(client *proofhub.Client) server.ToolHandlerFunc {
+func handleSubtaskGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		subtaskID, _ := req.RequireString("subtask_id")
-		for _, v := range []struct{ name, val string }{{"project_id", projectID}, {"todolist_id", todolistID}, {"task_id", taskID}, {"subtask_id", subtaskID}} {
-			if err := validateRequiredDigits(v.name, v.val); err != nil {
-				return errorResult("validation failed", err)
-			}
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
+		}
+		subtaskID, err := req.RequireString("subtask_id")
+		if err != nil {
+			return errorResult("missing subtask_id", err)
+		}
+		if !isDigits(taskID) || !isDigits(subtaskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id or subtask_id: want digits"))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1106,24 +1011,22 @@ func handleSubtaskGet(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleSubtaskCreate(client *proofhub.Client) server.ToolHandlerFunc {
+func handleSubtaskCreate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		title, _ := req.RequireString("title")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
+		title, err := req.RequireString("title")
+		if err != nil {
+			return errorResult("missing title", err)
 		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		if strings.TrimSpace(title) == "" {
 			return errorResult("validation failed", fmt.Errorf("title is required"))
@@ -1161,20 +1064,22 @@ func handleSubtaskCreate(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleSubtaskUpdate(client *proofhub.Client) server.ToolHandlerFunc {
+func handleSubtaskUpdate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		subtaskID, _ := req.RequireString("subtask_id")
-		for _, v := range []struct{ name, val string }{{"project_id", projectID}, {"todolist_id", todolistID}, {"task_id", taskID}, {"subtask_id", subtaskID}} {
-			if err := validateRequiredDigits(v.name, v.val); err != nil {
-				return errorResult("validation failed", err)
-			}
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
+		}
+		subtaskID, err := req.RequireString("subtask_id")
+		if err != nil {
+			return errorResult("missing subtask_id", err)
+		}
+		if !isDigits(taskID) || !isDigits(subtaskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id or subtask_id: want digits"))
 		}
 		var payload proofhub.UpdateSubtaskRequest
 		if hasArg(req, "title") {
@@ -1229,20 +1134,22 @@ func handleSubtaskUpdate(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleSubtaskDelete(client *proofhub.Client) server.ToolHandlerFunc {
+func handleSubtaskDelete(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		subtaskID, _ := req.RequireString("subtask_id")
-		for _, v := range []struct{ name, val string }{{"project_id", projectID}, {"todolist_id", todolistID}, {"task_id", taskID}, {"subtask_id", subtaskID}} {
-			if err := validateRequiredDigits(v.name, v.val); err != nil {
-				return errorResult("validation failed", err)
-			}
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
+		}
+		subtaskID, err := req.RequireString("subtask_id")
+		if err != nil {
+			return errorResult("missing subtask_id", err)
+		}
+		if !isDigits(taskID) || !isDigits(subtaskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id or subtask_id: want digits"))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1253,23 +1160,18 @@ func handleSubtaskDelete(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleCommentList(client *proofhub.Client) server.ToolHandlerFunc {
+func handleCommentList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1281,20 +1183,22 @@ func handleCommentList(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleCommentGet(client *proofhub.Client) server.ToolHandlerFunc {
+func handleCommentGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		commentID, _ := req.RequireString("comment_id")
-		for _, v := range []struct{ name, val string }{{"project_id", projectID}, {"todolist_id", todolistID}, {"task_id", taskID}, {"comment_id", commentID}} {
-			if err := validateRequiredDigits(v.name, v.val); err != nil {
-				return errorResult("validation failed", err)
-			}
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
+		}
+		commentID, err := req.RequireString("comment_id")
+		if err != nil {
+			return errorResult("missing comment_id", err)
+		}
+		if !isDigits(taskID) || !isDigits(commentID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id or comment_id: want digits"))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1306,24 +1210,22 @@ func handleCommentGet(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleCommentCreate(client *proofhub.Client) server.ToolHandlerFunc {
+func handleCommentCreate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		desc, _ := req.RequireString("description")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
+		desc, err := req.RequireString("description")
+		if err != nil {
+			return errorResult("missing description", err)
 		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		if strings.TrimSpace(desc) == "" {
 			return errorResult("validation failed", fmt.Errorf("description is required"))
@@ -1338,21 +1240,26 @@ func handleCommentCreate(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleCommentUpdate(client *proofhub.Client) server.ToolHandlerFunc {
+func handleCommentUpdate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		commentID, _ := req.RequireString("comment_id")
-		desc, _ := req.RequireString("description")
-		for _, v := range []struct{ name, val string }{{"project_id", projectID}, {"todolist_id", todolistID}, {"task_id", taskID}, {"comment_id", commentID}} {
-			if err := validateRequiredDigits(v.name, v.val); err != nil {
-				return errorResult("validation failed", err)
-			}
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
+		}
+		commentID, err := req.RequireString("comment_id")
+		if err != nil {
+			return errorResult("missing comment_id", err)
+		}
+		desc, err := req.RequireString("description")
+		if err != nil {
+			return errorResult("missing description", err)
+		}
+		if !isDigits(taskID) || !isDigits(commentID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id or comment_id: want digits"))
 		}
 		if strings.TrimSpace(desc) == "" {
 			return errorResult("validation failed", fmt.Errorf("description is required"))
@@ -1367,20 +1274,22 @@ func handleCommentUpdate(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleCommentDelete(client *proofhub.Client) server.ToolHandlerFunc {
+func handleCommentDelete(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		commentID, _ := req.RequireString("comment_id")
-		for _, v := range []struct{ name, val string }{{"project_id", projectID}, {"todolist_id", todolistID}, {"task_id", taskID}, {"comment_id", commentID}} {
-			if err := validateRequiredDigits(v.name, v.val); err != nil {
-				return errorResult("validation failed", err)
-			}
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
+		}
+		commentID, err := req.RequireString("comment_id")
+		if err != nil {
+			return errorResult("missing comment_id", err)
+		}
+		if !isDigits(taskID) || !isDigits(commentID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id or comment_id: want digits"))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1391,23 +1300,18 @@ func handleCommentDelete(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleHistoryList(client *proofhub.Client) server.ToolHandlerFunc {
+func handleHistoryList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
 		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("task_id", taskID); err != nil {
-			return errorResult("validation failed", err)
+		if !isDigits(taskID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id %q: want numeric id", taskID))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1419,20 +1323,22 @@ func handleHistoryList(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleHistoryGet(client *proofhub.Client) server.ToolHandlerFunc {
+func handleHistoryGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		taskID, _ := req.RequireString("task_id")
-		historyID, _ := req.RequireString("history_id")
-		for _, v := range []struct{ name, val string }{{"project_id", projectID}, {"todolist_id", todolistID}, {"task_id", taskID}, {"history_id", historyID}} {
-			if err := validateRequiredDigits(v.name, v.val); err != nil {
-				return errorResult("validation failed", err)
-			}
+		taskID, err := req.RequireString("task_id")
+		if err != nil {
+			return errorResult("missing task_id", err)
+		}
+		historyID, err := req.RequireString("history_id")
+		if err != nil {
+			return errorResult("missing history_id", err)
+		}
+		if !isDigits(taskID) || !isDigits(historyID) {
+			return errorResult("validation failed", fmt.Errorf("invalid task_id or history_id: want digits"))
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1444,19 +1350,11 @@ func handleHistoryGet(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTodolistGet(client *proofhub.Client) server.ToolHandlerFunc {
+func handleTodolistGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
-		}
-		projectID, _ := req.RequireString("project_id")
-		todolistID, _ := req.RequireString("todolist_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("todolist_id", todolistID); err != nil {
-			return errorResult("validation failed", err)
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1465,50 +1363,6 @@ func handleTodolistGet(client *proofhub.Client) server.ToolHandlerFunc {
 			return errorResult("get todolist failed", err)
 		}
 		return jsonResult(tl)
-	}
-}
-
-func handleLabelGet(client *proofhub.Client) server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		c, err := mustClient(client)
-		if err != nil {
-			return errorResult("client not configured", err)
-		}
-		labelID, _ := req.RequireString("label_id")
-		if err := validateRequiredDigits("label_id", labelID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		tctx, cancel := withTimeout(ctx)
-		defer cancel()
-		l, err := c.GetLabel(tctx, labelID)
-		if err != nil {
-			return errorResult("get label failed", err)
-		}
-		return jsonResult(l)
-	}
-}
-
-func handleTimesheetGet(client *proofhub.Client) server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		c, err := mustClient(client)
-		if err != nil {
-			return errorResult("client not configured", err)
-		}
-		projectID, _ := req.RequireString("project_id")
-		timesheetID, _ := req.RequireString("timesheet_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		if err := validateRequiredDigits("timesheet_id", timesheetID); err != nil {
-			return errorResult("validation failed", err)
-		}
-		tctx, cancel := withTimeout(ctx)
-		defer cancel()
-		ts, err := c.GetTimesheet(tctx, projectID, timesheetID)
-		if err != nil {
-			return errorResult("get timesheet failed", err)
-		}
-		return jsonResult(ts)
 	}
 }
 
@@ -1528,15 +1382,34 @@ func handleLabelList(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func handleTimesheetList(client *proofhub.Client) server.ToolHandlerFunc {
+func handleLabelGet(client *proofhub.Client) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
-		projectID, _ := req.RequireString("project_id")
-		if err := validateRequiredDigits("project_id", projectID); err != nil {
-			return errorResult("validation failed", err)
+		labelID, err := req.RequireString("label_id")
+		if err != nil {
+			return errorResult("missing label_id", err)
+		}
+		if !isDigits(labelID) {
+			return errorResult("validation failed", fmt.Errorf("invalid label_id %q: want numeric id", labelID))
+		}
+		tctx, cancel := withTimeout(ctx)
+		defer cancel()
+		l, err := c.GetLabel(tctx, labelID)
+		if err != nil {
+			return errorResult("get label failed", err)
+		}
+		return jsonResult(l)
+	}
+}
+
+func handleTimesheetList(client *proofhub.Client, projectID string) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		c, err := mustClient(client)
+		if err != nil {
+			return errorResult("client not configured", err)
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
@@ -1548,8 +1421,25 @@ func handleTimesheetList(client *proofhub.Client) server.ToolHandlerFunc {
 	}
 }
 
-func hasArg(req mcp.CallToolRequest, key string) bool {
-	args := req.GetArguments()
-	_, ok := args[key]
-	return ok
+func handleTimesheetGet(client *proofhub.Client, projectID string) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		c, err := mustClient(client)
+		if err != nil {
+			return errorResult("client not configured", err)
+		}
+		timesheetID, err := req.RequireString("timesheet_id")
+		if err != nil {
+			return errorResult("missing timesheet_id", err)
+		}
+		if !isDigits(timesheetID) {
+			return errorResult("validation failed", fmt.Errorf("invalid timesheet_id %q: want numeric id", timesheetID))
+		}
+		tctx, cancel := withTimeout(ctx)
+		defer cancel()
+		ts, err := c.GetTimesheet(tctx, projectID, timesheetID)
+		if err != nil {
+			return errorResult("get timesheet failed", err)
+		}
+		return jsonResult(ts)
+	}
 }
