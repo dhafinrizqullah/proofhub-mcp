@@ -7,7 +7,7 @@ import (
 	"net/http"
 )
 
-// todolist.go provides Todolist and Person types and API methods.
+// todolist.go provides Todolist types and API methods.
 
 // Todolist mirrors GET todolist response (subset). Expanded for Get todolist detail.
 type Todolist struct {
@@ -71,25 +71,3 @@ func (c *Client) GetTodolist(ctx context.Context, projectID, todolistID string) 
 	}
 	return &tl, nil
 }
-
-// Person mirrors people API (subset).
-type Person struct {
-	ID        int64  `json:"id"`
-	FirstName string `json:"first_name"`
-	LastName  string `json:"last_name"`
-	Email     string `json:"email"`
-}
-
-// ListPeople: GET v3/people
-func (c *Client) ListPeople(ctx context.Context) ([]Person, error) {
-	b, _, err := c.do(ctx, http.MethodGet, "/people", nil)
-	if err != nil {
-		return nil, err
-	}
-	var people []Person
-	if err := json.Unmarshal(b, &people); err != nil {
-		return nil, fmt.Errorf("decode people response: %w", err)
-	}
-	return people, nil
-}
-

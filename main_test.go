@@ -277,8 +277,9 @@ func TestToolRegistration(t *testing.T) {
 		newCommentListTool(), newCommentGetTool(), newCommentCreateTool(), newCommentUpdateTool(), newCommentDeleteTool(),
 		newHistoryListTool(), newHistoryGetTool(),
 		newTodolistGetTool(), newLabelListTool(), newLabelGetTool(), newTimesheetListTool(), newTimesheetGetTool(),
+		newPeopleListTool(),
 	}
-	assert.Len(t, allTools, 24, "should have 24 tools (7+5+5+2+1+2+2)")
+	assert.Len(t, allTools, 25, "should have 25 tools (7+5+5+2+1+2+2+1)")
 
 	tests := []struct {
 		name            string

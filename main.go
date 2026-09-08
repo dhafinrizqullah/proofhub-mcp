@@ -374,6 +374,7 @@ func registerTools(s *server.MCPServer, client *proofhub.Client, projectID, todo
 	s.AddTool(newLabelGetTool(), handleLabelGet(client))
 	s.AddTool(newTimesheetListTool(), handleTimesheetList(client, projectID))
 	s.AddTool(newTimesheetGetTool(), handleTimesheetGet(client, projectID))
+	s.AddTool(newPeopleListTool(), handlePeopleList(client))
 }
 
 // --- tool definitions with full descriptions ---
@@ -600,6 +601,12 @@ func newTimesheetGetTool() mcp.Tool {
 	return mcp.NewTool("timesheet_get",
 		mcp.WithDescription("Get a single timesheet in the scoped project. Requires timesheet_id (digits). Project injected from ENV."),
 		mcp.WithString("timesheet_id", mcp.Required(), mcp.Description("Timesheet ID (digits)"), mcp.Pattern("^[0-9]+$")),
+	)
+}
+
+func newPeopleListTool() mcp.Tool {
+	return mcp.NewTool("people_list",
+		mcp.WithDescription("List all people in ProofHub account (global). Use to lookup assignee IDs for task_create/task_update/subtask. Returns id, first_name, last_name, email. No input required."),
 	)
 }
 
@@ -1441,5 +1448,21 @@ func handleTimesheetGet(client *proofhub.Client, projectID string) server.ToolHa
 			return errorResult("get timesheet failed", err)
 		}
 		return jsonResult(ts)
+	}
+}
+
+func handlePeopleList(client *proofhub.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		c, err := mustClient(client)
+		if err != nil {
+			return errorResult("client not configured", err)
+		}
+		tctx, cancel := withTimeout(ctx)
+		defer cancel()
+		people, err := c.ListPeople(tctx)
+		if err != nil {
+			return errorResult("list people failed", err)
+		}
+		return jsonResult(people)
 	}
 }

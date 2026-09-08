@@ -30,9 +30,9 @@ ENV validation runs at startup — lowercase errors without leaking secrets (`pr
 
 > Tip: On some ProofHub versions you need to click the profile picture 5 times to reveal the API key field.
 
-## Tools (24) — single todolist scope
+## Tools (25) — single todolist scope
 
-All tools are scoped to `PROOFHUB_PROJECT_ID`/`PROOFHUB_TODOLIST_ID` from ENV. No `project_id`/`todolist_id` params in input — the agent only needs `task_id`, `subtask_id`, etc.
+All tools are scoped to `PROOFHUB_PROJECT_ID`/`PROOFHUB_TODOLIST_ID` from ENV, except `label_*` and `people_list` which are global (no project/todolist). No `project_id`/`todolist_id` params in input — the agent only needs `task_id`, `subtask_id`, etc.
 
 | Tool | Description | Input | Output |
 |------|-------------|-------|--------|
@@ -60,8 +60,24 @@ All tools are scoped to `PROOFHUB_PROJECT_ID`/`PROOFHUB_TODOLIST_ID` from ENV. N
 | `label_get` | Get a single label by ID. Requires label_id (digits). Global lookup, not bound to ENV todolist. | `label_id` (digits) | `Label` JSON |
 | `timesheet_list` | List timesheets in the scoped project (PROOFHUB_PROJECT_ID). No project input required — injected from ENV. Use to lookup timesheets before logging time. | - | `Timesheet[]` JSON |
 | `timesheet_get` | Get a single timesheet in the scoped project. Requires timesheet_id (digits). Project injected from ENV. | `timesheet_id` (digits) | `Timesheet` JSON |
+| `people_list` | List all people in ProofHub account (global). Use to lookup assignee IDs for task_create/task_update/subtask. Returns id, first_name, last_name, email. No input required. | - | `Person[]` JSON |
 
 > All `WithDescription` strings in `main.go` exactly match the Description column above. Input validation: `isDigits` for all IDs (`pattern ^[0-9]+$`), `YYYY-MM-DD` for dates, `required` per schema.
+
+## Assignees
+
+Assignee IDs are `people_id` values discovered via `people_list`. Before calling `task_create`, `task_update`, `subtask_create`, or `subtask_update`, call `people_list` to lookup users by `first_name`/`last_name`/`email` and use their `id` in `assigned`.
+
+Example:
+
+```json
+{
+  "title": "Fix onboarding bug",
+  "assigned": [9526247227]
+}
+```
+
+Lookup flow: `people_list` → find `id` for `first_name`/`email` → `task_create` with `assigned: [9526247227]`. `people_list` is global (not scoped to `PROOFHUB_PROJECT_ID`/`TODOLIST_ID`) — no input required, no filtering by project.
 
 ## Binary
 
