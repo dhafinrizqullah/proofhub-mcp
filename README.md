@@ -24,7 +24,7 @@ ENV validation runs at startup — lowercase errors without leaking secrets (`pr
 ### How to get your API key
 
 1. Log in to your ProofHub account (`https://yourcompany.proofhub.com`).
-2. Click your profile picture/avatar in the top-right corner.
+2. Click your profile picture/avatar in the bottom-left corner.
 3. Open **Profile** → **API Access** menu.
 4. Copy the API key (used as `X-API-KEY` / `PROOFHUB_API_KEY`). Keep it secret — never commit it to git.
 
