@@ -20,13 +20,13 @@ import (
 var version = "dev"
 
 type config struct {
-	baseURL    string
-	apiKey     string
-	userAgent  string
-	projectID  string
-	todolistID string
-	transport  string
-	httpPort   string
+	baseURL     string
+	apiKey      string
+	userAgent   string
+	projectID   string
+	todolistIDs []string
+	transport   string
+	httpPort    string
 }
 
 func main() {
@@ -56,7 +56,7 @@ func run(args []string) error {
 		server.WithRecovery(),
 	)
 
-	registerTools(s, client, cfg.projectID, cfg.todolistID)
+	registerTools(s, client, cfg.projectID, cfg.todolistIDs)
 
 	switch cfg.transport {
 	case "http":
@@ -71,13 +71,26 @@ func run(args []string) error {
 
 func loadConfig(args []string) (*config, error) {
 	cfg := &config{
-		baseURL:    strings.TrimSpace(os.Getenv("PROOFHUB_BASE_URL")),
-		apiKey:     strings.TrimSpace(os.Getenv("PROOFHUB_API_KEY")),
-		userAgent:  strings.TrimSpace(os.Getenv("PROOFHUB_USER_AGENT")),
-		projectID:  strings.TrimSpace(os.Getenv("PROOFHUB_PROJECT_ID")),
-		todolistID: strings.TrimSpace(os.Getenv("PROOFHUB_TODOLIST_ID")),
-		transport:  strings.TrimSpace(os.Getenv("MCP_TRANSPORT")),
-		httpPort:   strings.TrimSpace(os.Getenv("MCP_HTTP_PORT")),
+		baseURL:   strings.TrimSpace(os.Getenv("PROOFHUB_BASE_URL")),
+		apiKey:    strings.TrimSpace(os.Getenv("PROOFHUB_API_KEY")),
+		userAgent: strings.TrimSpace(os.Getenv("PROOFHUB_USER_AGENT")),
+		projectID: strings.TrimSpace(os.Getenv("PROOFHUB_PROJECT_ID")),
+		transport: strings.TrimSpace(os.Getenv("MCP_TRANSPORT")),
+		httpPort:  strings.TrimSpace(os.Getenv("MCP_HTTP_PORT")),
+	}
+	// Maintainable todolists: PROOFHUB_TODOLIST_IDS is a comma-separated
+	// allowlist (e.g. "2714,2720,2731"). The legacy single PROOFHUB_TODOLIST_ID
+	// still works as a one-element allowlist for backward compatibility.
+	rawLists := strings.TrimSpace(os.Getenv("PROOFHUB_TODOLIST_IDS"))
+	if rawLists == "" {
+		rawLists = strings.TrimSpace(os.Getenv("PROOFHUB_TODOLIST_ID"))
+	}
+	if rawLists != "" {
+		ids, err := parseTodolistIDs(rawLists)
+		if err != nil {
+			return nil, err
+		}
+		cfg.todolistIDs = ids
 	}
 	if cfg.transport == "" {
 		cfg.transport = "stdio"
@@ -108,18 +121,29 @@ func loadConfig(args []string) (*config, error) {
 			return nil, fmt.Errorf("invalid mcp_http_port %q: want numeric port", cfg.httpPort)
 		}
 	}
-	// Re-read env for project/todolist if flags didn't override (flags don't cover them)
-	// Allow --project-id and --todolist-id as flags for local testing
-	var flagProject, flagTodolist string
+	// Re-read env for project/todolists if flags didn't override (flags don't cover them)
+	// Allow --project-id and --todolist-ids as flags for local testing
+	var flagProject, flagTodolists, flagTodolist string
 	fs2 := flag.NewFlagSet("extra", flag.ContinueOnError)
 	fs2.StringVar(&flagProject, "project-id", "", "")
+	fs2.StringVar(&flagTodolists, "todolist-ids", "", "")
 	fs2.StringVar(&flagTodolist, "todolist-id", "", "")
 	_ = fs2.Parse(args)
 	if flagProject != "" {
 		cfg.projectID = strings.TrimSpace(flagProject)
 	}
-	if flagTodolist != "" {
-		cfg.todolistID = strings.TrimSpace(flagTodolist)
+	if flagTodolists != "" {
+		ids, err := parseTodolistIDs(flagTodolists)
+		if err != nil {
+			return nil, err
+		}
+		cfg.todolistIDs = ids
+	} else if flagTodolist != "" {
+		ids, err := parseTodolistIDs(flagTodolist)
+		if err != nil {
+			return nil, err
+		}
+		cfg.todolistIDs = ids
 	}
 	return cfg, nil
 }
@@ -134,8 +158,13 @@ func validateConfig(cfg *config) error {
 	if !isDigits(cfg.projectID) {
 		return fmt.Errorf("proofhub_project_id is required and must be digits, got %q", cfg.projectID)
 	}
-	if !isDigits(cfg.todolistID) {
-		return fmt.Errorf("proofhub_todolist_id is required and must be digits, got %q", cfg.todolistID)
+	if len(cfg.todolistIDs) == 0 {
+		return fmt.Errorf("proofhub_todolist_ids is required and must be comma-separated digits, got %q", "")
+	}
+	for _, id := range cfg.todolistIDs {
+		if !isDigits(id) {
+			return fmt.Errorf("proofhub_todolist_ids must be comma-separated digits, got %q", id)
+		}
 	}
 	// User-Agent validation is done via proofhub.Client.Validate, but also check format here for fail fast
 	if cfg.userAgent != "" {
@@ -170,6 +199,73 @@ func serveHTTP(s *server.MCPServer, port string) error {
 }
 
 // --- validation helpers ---
+
+// parseTodolistIDs parses a comma-separated allowlist (e.g. "2714, 2720")
+// into deduplicated digit IDs, preserving order.
+func parseTodolistIDs(raw string) ([]string, error) {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if !isDigits(id) {
+			return nil, fmt.Errorf("invalid todolist id %q: want comma-separated digits", id)
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("todolist ids is required and must be comma-separated digits, got %q", raw)
+	}
+	return out, nil
+}
+
+func isAllowedTodolist(id string, allowed []string) bool {
+	for _, a := range allowed {
+		if a == id {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveTodolist returns the effective todolist: the per-call todolist_id
+// when given (must be in the ENV allowlist), the single allowlist entry when
+// only one list is configured, or an error asking the caller to pick one.
+func resolveTodolist(req mcp.CallToolRequest, allowed []string) (string, error) {
+	if v := getOptionalString(req, "todolist_id"); v != "" {
+		if !isDigits(v) {
+			return "", fmt.Errorf("invalid todolist_id %q: want numeric id", v)
+		}
+		if !isAllowedTodolist(v, allowed) {
+			return "", fmt.Errorf("todolist_id %q is not maintainable (allowed: %s)", v, strings.Join(allowed, ","))
+		}
+		return v, nil
+	}
+	if len(allowed) == 1 {
+		return allowed[0], nil
+	}
+	return "", fmt.Errorf("todolist_id is required (maintainable: %s)", strings.Join(allowed, ","))
+}
+
+// resolveNewTodolist returns the destination list for copy/move: new_todolist_id
+// when given (must be in the allowlist), otherwise the source list.
+func resolveNewTodolist(req mcp.CallToolRequest, allowed []string, source string) (string, error) {
+	if v := getOptionalString(req, "new_todolist_id"); v != "" {
+		if !isDigits(v) {
+			return "", fmt.Errorf("invalid new_todolist_id %q: want numeric id", v)
+		}
+		if !isAllowedTodolist(v, allowed) {
+			return "", fmt.Errorf("new_todolist_id %q is not maintainable (allowed: %s)", v, strings.Join(allowed, ","))
+		}
+		return v, nil
+	}
+	return source, nil
+}
 
 func isDigits(s string) bool {
 	if s == "" {
@@ -343,33 +439,37 @@ func mustClient(c *proofhub.Client) (*proofhub.Client, error) {
 }
 
 // --- tool registration ---
-// Scope: single todolist via ENV PROOFHUB_PROJECT_ID / PROOFHUB_TODOLIST_ID PROOFHUB_PROJECT_ID / PROOFHUB_TODOLIST_ID
+// Scope: single project via ENV PROOFHUB_PROJECT_ID; maintainable todolists via
+// ENV PROOFHUB_TODOLIST_IDS (comma-separated allowlist, legacy PROOFHUB_TODOLIST_ID
+// for one list). No tool escapes ENV: no project_id param anywhere; todolist_id
+// and new_todolist_id are allowlist-enforced (omit todolist_id only with one list).
 
-func registerTools(s *server.MCPServer, client *proofhub.Client, projectID, todolistID string) {
-	s.AddTool(newTaskListTool(), handleTaskList(client, projectID, todolistID))
-	s.AddTool(newTaskGetTool(), handleTaskGet(client, projectID, todolistID))
-	s.AddTool(newTaskCreateTool(), handleTaskCreate(client, projectID, todolistID))
-	s.AddTool(newTaskUpdateTool(), handleTaskUpdate(client, projectID, todolistID))
-	s.AddTool(newTaskDeleteTool(), handleTaskDelete(client, projectID, todolistID))
-	s.AddTool(newTaskCopyTool(), handleTaskCopy(client, projectID, todolistID))
-	s.AddTool(newTaskMoveTool(), handleTaskMove(client, projectID, todolistID))
+func registerTools(s *server.MCPServer, client *proofhub.Client, projectID string, todolistIDs []string) {
+	s.AddTool(newTaskListTool(), handleTaskList(client, projectID, todolistIDs))
+	s.AddTool(newTaskGetTool(), handleTaskGet(client, projectID, todolistIDs))
+	s.AddTool(newTaskCreateTool(), handleTaskCreate(client, projectID, todolistIDs))
+	s.AddTool(newTaskUpdateTool(), handleTaskUpdate(client, projectID, todolistIDs))
+	s.AddTool(newTaskDeleteTool(), handleTaskDelete(client, projectID, todolistIDs))
+	s.AddTool(newTaskCopyTool(), handleTaskCopy(client, projectID, todolistIDs))
+	s.AddTool(newTaskMoveTool(), handleTaskMove(client, projectID, todolistIDs))
 
-	s.AddTool(newSubtaskListTool(), handleSubtaskList(client, projectID, todolistID))
-	s.AddTool(newSubtaskGetTool(), handleSubtaskGet(client, projectID, todolistID))
-	s.AddTool(newSubtaskCreateTool(), handleSubtaskCreate(client, projectID, todolistID))
-	s.AddTool(newSubtaskUpdateTool(), handleSubtaskUpdate(client, projectID, todolistID))
-	s.AddTool(newSubtaskDeleteTool(), handleSubtaskDelete(client, projectID, todolistID))
+	s.AddTool(newSubtaskListTool(), handleSubtaskList(client, projectID, todolistIDs))
+	s.AddTool(newSubtaskGetTool(), handleSubtaskGet(client, projectID, todolistIDs))
+	s.AddTool(newSubtaskCreateTool(), handleSubtaskCreate(client, projectID, todolistIDs))
+	s.AddTool(newSubtaskUpdateTool(), handleSubtaskUpdate(client, projectID, todolistIDs))
+	s.AddTool(newSubtaskDeleteTool(), handleSubtaskDelete(client, projectID, todolistIDs))
 
-	s.AddTool(newCommentListTool(), handleCommentList(client, projectID, todolistID))
-	s.AddTool(newCommentGetTool(), handleCommentGet(client, projectID, todolistID))
-	s.AddTool(newCommentCreateTool(), handleCommentCreate(client, projectID, todolistID))
-	s.AddTool(newCommentUpdateTool(), handleCommentUpdate(client, projectID, todolistID))
-	s.AddTool(newCommentDeleteTool(), handleCommentDelete(client, projectID, todolistID))
+	s.AddTool(newCommentListTool(), handleCommentList(client, projectID, todolistIDs))
+	s.AddTool(newCommentGetTool(), handleCommentGet(client, projectID, todolistIDs))
+	s.AddTool(newCommentCreateTool(), handleCommentCreate(client, projectID, todolistIDs))
+	s.AddTool(newCommentUpdateTool(), handleCommentUpdate(client, projectID, todolistIDs))
+	s.AddTool(newCommentDeleteTool(), handleCommentDelete(client, projectID, todolistIDs))
 
-	s.AddTool(newHistoryListTool(), handleHistoryList(client, projectID, todolistID))
-	s.AddTool(newHistoryGetTool(), handleHistoryGet(client, projectID, todolistID))
+	s.AddTool(newHistoryListTool(), handleHistoryList(client, projectID, todolistIDs))
+	s.AddTool(newHistoryGetTool(), handleHistoryGet(client, projectID, todolistIDs))
 
-	s.AddTool(newTodolistGetTool(), handleTodolistGet(client, projectID, todolistID))
+	s.AddTool(newTodolistGetTool(), handleTodolistGet(client, projectID, todolistIDs))
+	s.AddTool(newTodolistListTool(), handleTodolistList(client, projectID, todolistIDs))
 	s.AddTool(newLabelListTool(), handleLabelList(client))
 	s.AddTool(newLabelGetTool(), handleLabelGet(client))
 	s.AddTool(newTimesheetListTool(), handleTimesheetList(client, projectID))
@@ -381,20 +481,22 @@ func registerTools(s *server.MCPServer, client *proofhub.Client, projectID, todo
 
 func newTaskListTool() mcp.Tool {
 	return mcp.NewTool("task_list",
-		mcp.WithDescription("List all tasks in the scoped todolist (PROOFHUB_PROJECT_ID/PROOFHUB_TODOLIST_ID). Returns array of tasks with id, ticket, title, status. No project/list input required — injected from ENV."),
+		mcp.WithDescription("List all tasks in a maintainable todolist. Single project (ENV); todolist_id must be one of PROOFHUB_TODOLIST_IDS (omit only when one list is configured)."),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskGetTool() mcp.Tool {
 	return mcp.NewTool("task_get",
-		mcp.WithDescription("Get a single task in the scoped todolist (ENV). Requires task_id (digits). Returns full details: title, description, dates, progress, stage, assignees, labels."),
+		mcp.WithDescription("Get a single task in a maintainable todolist. Requires task_id (digits) and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID (digits only)"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskCreateTool() mcp.Tool {
 	return mcp.NewTool("task_create",
-		mcp.WithDescription("Create a new task in the scoped todolist. Requires title; optional description, start/due dates, estimates, assignees, labels. Project/todolist injected from ENV, cannot create outside scope."),
+		mcp.WithDescription("Create a new task in a maintainable todolist. Requires title and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("title", mcp.Required(), mcp.Description("Task title (required)")),
 		mcp.WithString("description", mcp.Description("Task description (HTML allowed, e.g. <b>Label:</b> ...<br>)")),
 		mcp.WithString("start_date", mcp.Description("Start date YYYY-MM-DD"), mcp.Pattern("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
@@ -403,12 +505,13 @@ func newTaskCreateTool() mcp.Tool {
 		mcp.WithNumber("estimated_mins", mcp.Description("Estimated minutes (integer)")),
 		mcp.WithArray("assigned", mcp.Description("Assignee people IDs (array of integers, e.g. [9526247227])")),
 		mcp.WithArray("labels", mcp.Description("Label IDs (array of integers, e.g. [5775379693,7273284338])")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskUpdateTool() mcp.Tool {
 	return mcp.NewTool("task_update",
-		mcp.WithDescription("Update a task in the scoped todolist. Requires task_id; optional: title, description, dates (YYYY-MM-DD), estimated_hours/mins, logged_hours/mins, percent_progress 0-100, assignees, labels, completed (bool), stage_id."),
+		mcp.WithDescription("Update a task in a maintainable todolist. Requires task_id and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID (digits)"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Description("New title")),
 		mcp.WithString("description", mcp.Description("New description (HTML allowed)")),
@@ -423,19 +526,21 @@ func newTaskUpdateTool() mcp.Tool {
 		mcp.WithArray("labels", mcp.Description("Label IDs (array)")),
 		mcp.WithBoolean("completed", mcp.Description("Mark completed true/false")),
 		mcp.WithString("stage_id", mcp.Description("Stage ID (digits)"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskDeleteTool() mcp.Tool {
 	return mcp.NewTool("task_delete",
-		mcp.WithDescription("Delete a task inside the scoped todolist. Can only delete within the ENV-configured todolist."),
+		mcp.WithDescription("Delete a task in a maintainable todolist. Requires task_id and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID (digits)"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskCopyTool() mcp.Tool {
 	return mcp.NewTool("task_copy",
-		mcp.WithDescription("Copy (duplicate) a task inside the scoped todolist. Creates duplicate in the same todolist (single-todolist scope). Optional: new title, stage_id, copy_assignees/custom_fields/dates/comments."),
+		mcp.WithDescription("Copy (duplicate) a task between maintainable todolists (same project). todolist_id and new_todolist_id must be in PROOFHUB_TODOLIST_IDS; destination defaults to source."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID to copy (digits)"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Description("Title for copied task (optional, default 'Copy of ...')")),
 		mcp.WithString("stage_id", mcp.Description("Stage ID for copied task (digits)"), mcp.Pattern("^[0-9]+$")),
@@ -443,12 +548,14 @@ func newTaskCopyTool() mcp.Tool {
 		mcp.WithBoolean("copy_custom_fields", mcp.Description("Copy custom fields (default true)")),
 		mcp.WithBoolean("copy_dates", mcp.Description("Copy dates (default true)")),
 		mcp.WithBoolean("copy_comments", mcp.Description("Copy comments (default true)")),
+		mcp.WithString("todolist_id", mcp.Description("Source todolist ID, must be maintainable"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("new_todolist_id", mcp.Description("Destination todolist ID, must be maintainable (default same as source)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTaskMoveTool() mcp.Tool {
 	return mcp.NewTool("task_move",
-		mcp.WithDescription("Move a task inside the scoped todolist (single-todolist scope). Cannot move to another project/list. Optional: title, stage_id, move_people, copy_assignees/custom_fields, move_dates, proof_comment, copy_comments, completed."),
+		mcp.WithDescription("Move a task between maintainable todolists (same project). todolist_id and new_todolist_id must be in PROOFHUB_TODOLIST_IDS; destination defaults to source."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID to move (digits)"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Description("New title (optional)")),
 		mcp.WithString("stage_id", mcp.Description("Stage ID (digits)"), mcp.Pattern("^[0-9]+$")),
@@ -459,27 +566,31 @@ func newTaskMoveTool() mcp.Tool {
 		mcp.WithBoolean("proof_comment", mcp.Description("Proof comment")),
 		mcp.WithBoolean("copy_comments", mcp.Description("Copy comments")),
 		mcp.WithBoolean("completed", mcp.Description("Completed flag")),
+		mcp.WithString("todolist_id", mcp.Description("Source todolist ID, must be maintainable"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("new_todolist_id", mcp.Description("Destination todolist ID, must be maintainable (default same as source)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newSubtaskListTool() mcp.Tool {
 	return mcp.NewTool("subtask_list",
-		mcp.WithDescription("List subtasks under a task in the scoped todolist. Requires task_id. Returns array of subtasks."),
+		mcp.WithDescription("List subtasks under a task in a maintainable todolist. Requires task_id and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID (digits)"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newSubtaskGetTool() mcp.Tool {
 	return mcp.NewTool("subtask_get",
-		mcp.WithDescription("Get a single subtask in the scoped todolist. Requires task_id and subtask_id."),
+		mcp.WithDescription("Get a single subtask in a maintainable todolist. Requires task_id, subtask_id, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("subtask_id", mcp.Required(), mcp.Description("Subtask ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newSubtaskCreateTool() mcp.Tool {
 	return mcp.NewTool("subtask_create",
-		mcp.WithDescription("Create a new subtask under a task in the scoped todolist. Requires task_id and title; optional: description, start/due (YYYY-MM-DD), estimated_hours/mins, assignees, labels."),
+		mcp.WithDescription("Create a new subtask in a maintainable todolist. Requires task_id, title, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Required(), mcp.Description("Subtask title (required)")),
 		mcp.WithString("description", mcp.Description("Description")),
@@ -489,12 +600,13 @@ func newSubtaskCreateTool() mcp.Tool {
 		mcp.WithNumber("estimated_mins", mcp.Description("Estimated minutes")),
 		mcp.WithArray("assigned", mcp.Description("Assignee IDs")),
 		mcp.WithArray("labels", mcp.Description("Label IDs")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newSubtaskUpdateTool() mcp.Tool {
 	return mcp.NewTool("subtask_update",
-		mcp.WithDescription("Update a subtask in the scoped todolist. Requires task_id and subtask_id; optional: title, description, dates, estimates, assignees, labels, completed."),
+		mcp.WithDescription("Update a subtask in a maintainable todolist. Requires task_id, subtask_id, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("subtask_id", mcp.Required(), mcp.Description("Subtask ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("title", mcp.Description("New title")),
@@ -506,75 +618,91 @@ func newSubtaskUpdateTool() mcp.Tool {
 		mcp.WithArray("assigned", mcp.Description("Assignee IDs")),
 		mcp.WithArray("labels", mcp.Description("Label IDs")),
 		mcp.WithBoolean("completed", mcp.Description("Completed flag true/false")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newSubtaskDeleteTool() mcp.Tool {
 	return mcp.NewTool("subtask_delete",
-		mcp.WithDescription("Delete a subtask in the scoped todolist. Requires task_id and subtask_id. Scoped to ENV todolist only."),
+		mcp.WithDescription("Delete a subtask in a maintainable todolist. Requires task_id, subtask_id, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Parent task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("subtask_id", mcp.Required(), mcp.Description("Subtask ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentListTool() mcp.Tool {
 	return mcp.NewTool("comment_list",
-		mcp.WithDescription("List comments on a task in the scoped todolist. Requires task_id. Returns array of comments with id, description, creator."),
+		mcp.WithDescription("List comments on a task in a maintainable todolist. Requires task_id and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentGetTool() mcp.Tool {
 	return mcp.NewTool("comment_get",
-		mcp.WithDescription("Get a single comment on a task in the scoped todolist. Requires task_id and comment_id."),
+		mcp.WithDescription("Get a single comment in a maintainable todolist. Requires task_id, comment_id, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("comment_id", mcp.Required(), mcp.Description("Comment ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentCreateTool() mcp.Tool {
 	return mcp.NewTool("comment_create",
-		mcp.WithDescription("Create a comment on a task in the scoped todolist. Requires task_id and description (comment text)."),
+		mcp.WithDescription("Create a comment on a task in a maintainable todolist. Requires task_id, description, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("description", mcp.Required(), mcp.Description("Comment text (required)")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentUpdateTool() mcp.Tool {
 	return mcp.NewTool("comment_update",
-		mcp.WithDescription("Update a comment on a task in the scoped todolist. Requires task_id, comment_id, and new description."),
+		mcp.WithDescription("Update a comment in a maintainable todolist. Requires task_id, comment_id, description, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("comment_id", mcp.Required(), mcp.Description("Comment ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("description", mcp.Required(), mcp.Description("New comment text (required)")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newCommentDeleteTool() mcp.Tool {
 	return mcp.NewTool("comment_delete",
-		mcp.WithDescription("Delete a comment on a task in the scoped todolist. Requires task_id and comment_id."),
+		mcp.WithDescription("Delete a comment in a maintainable todolist. Requires task_id, comment_id, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("comment_id", mcp.Required(), mcp.Description("Comment ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newHistoryListTool() mcp.Tool {
 	return mcp.NewTool("history_list",
-		mcp.WithDescription("List audit history for a task in the scoped todolist. Requires task_id. Returns activity history (updated, created, etc)."),
+		mcp.WithDescription("List audit history for a task in a maintainable todolist. Requires task_id and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newHistoryGetTool() mcp.Tool {
 	return mcp.NewTool("history_get",
-		mcp.WithDescription("Get a single history entry for a task in the scoped todolist. Requires task_id and history_id. Returns change content."),
+		mcp.WithDescription("Get a single history entry in a maintainable todolist. Requires task_id, history_id, and todolist_id from PROOFHUB_TODOLIST_IDS."),
 		mcp.WithString("task_id", mcp.Required(), mcp.Description("Task ID"), mcp.Pattern("^[0-9]+$")),
 		mcp.WithString("history_id", mcp.Required(), mcp.Description("History ID"), mcp.Pattern("^[0-9]+$")),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
 
 func newTodolistGetTool() mcp.Tool {
 	return mcp.NewTool("todolist_get",
-		mcp.WithDescription("Get the scoped todolist details (read-only). No input required — injected from PROOFHUB_PROJECT_ID/PROOFHUB_TODOLIST_ID. Returns title, privacy, archived, counts."),
+		mcp.WithDescription("Get maintainable todolist details. todolist_id must be in PROOFHUB_TODOLIST_IDS (omit only when one list is configured)."),
+		mcp.WithString("todolist_id", mcp.Description("Todolist ID, must be one of the maintainable lists (omit only when one list is configured)"), mcp.Pattern("^[0-9]+$")),
+	)
+}
+
+func newTodolistListTool() mcp.Tool {
+	return mcp.NewTool("todolist_list",
+		mcp.WithDescription("List the maintainable todolists configured via PROOFHUB_TODOLIST_IDS (single project). No input required."),
 	)
 }
 
@@ -593,13 +721,13 @@ func newLabelGetTool() mcp.Tool {
 
 func newTimesheetListTool() mcp.Tool {
 	return mcp.NewTool("timesheet_list",
-		mcp.WithDescription("List timesheets in the scoped project (PROOFHUB_PROJECT_ID). No project input required — injected from ENV. Use to lookup timesheets before logging time."),
+		mcp.WithDescription("List timesheets in the configured project (PROOFHUB_PROJECT_ID). No input required."),
 	)
 }
 
 func newTimesheetGetTool() mcp.Tool {
 	return mcp.NewTool("timesheet_get",
-		mcp.WithDescription("Get a single timesheet in the scoped project. Requires timesheet_id (digits). Project injected from ENV."),
+		mcp.WithDescription("Get a single timesheet in the configured project. Requires timesheet_id (digits)."),
 		mcp.WithString("timesheet_id", mcp.Required(), mcp.Description("Timesheet ID (digits)"), mcp.Pattern("^[0-9]+$")),
 	)
 }
@@ -610,17 +738,21 @@ func newPeopleListTool() mcp.Tool {
 	)
 }
 
-// --- handlers scoped to ENV project/todolist ---
+// --- handlers defaulting to ENV project/todolist, with per-call overrides ---
 
-func handleTaskList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTaskList(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
 		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
+		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		tasks, err := c.ListTasks(tctx, projectID, todolistID)
+		tasks, err := c.ListTasks(tctx, projectID, effList)
 		if err != nil {
 			return errorResult("list tasks failed", err)
 		}
@@ -628,11 +760,15 @@ func handleTaskList(client *proofhub.Client, projectID, todolistID string) serve
 	}
 }
 
-func handleTaskGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTaskGet(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -643,7 +779,7 @@ func handleTaskGet(client *proofhub.Client, projectID, todolistID string) server
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		task, err := c.GetTask(tctx, projectID, todolistID, taskID)
+		task, err := c.GetTask(tctx, projectID, effList, taskID)
 		if err != nil {
 			return errorResult("get task failed", err)
 		}
@@ -651,11 +787,15 @@ func handleTaskGet(client *proofhub.Client, projectID, todolistID string) server
 	}
 }
 
-func handleTaskCreate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTaskCreate(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		title, err := req.RequireString("title")
 		if err != nil {
@@ -701,7 +841,7 @@ func handleTaskCreate(client *proofhub.Client, projectID, todolistID string) ser
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		task, err := c.CreateTask(tctx, projectID, todolistID, payload)
+		task, err := c.CreateTask(tctx, projectID, effList, payload)
 		if err != nil {
 			return errorResult("create task failed", err)
 		}
@@ -709,11 +849,15 @@ func handleTaskCreate(client *proofhub.Client, projectID, todolistID string) ser
 	}
 }
 
-func handleTaskUpdate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTaskUpdate(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -816,7 +960,7 @@ func handleTaskUpdate(client *proofhub.Client, projectID, todolistID string) ser
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		task, err := c.UpdateTask(tctx, projectID, todolistID, taskID, payload)
+		task, err := c.UpdateTask(tctx, projectID, effList, taskID, payload)
 		if err != nil {
 			return errorResult("update task failed", err)
 		}
@@ -824,11 +968,15 @@ func handleTaskUpdate(client *proofhub.Client, projectID, todolistID string) ser
 	}
 }
 
-func handleTaskDelete(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTaskDelete(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -839,18 +987,22 @@ func handleTaskDelete(client *proofhub.Client, projectID, todolistID string) ser
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		if err := c.DeleteTask(tctx, projectID, todolistID, taskID); err != nil {
+		if err := c.DeleteTask(tctx, projectID, effList, taskID); err != nil {
 			return errorResult("delete task failed", err)
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("deleted task %s", taskID)), nil
 	}
 }
 
-func handleTaskCopy(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTaskCopy(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -886,14 +1038,21 @@ func handleTaskCopy(client *proofhub.Client, projectID, todolistID string) serve
 			b, _ := getOptionalBool(req, "copy_comments")
 			payload.CopyComments = b
 		}
-		// Enforce single-todolist scope: copy within same project/todolist
-		// Still send copy_task id, but disallow new project/list
+		// Destination stays in the same project; new_todolist_id must be
+		// in the maintainable allowlist, defaulting to the source list.
+		destList, err := resolveNewTodolist(req, todolistIDs, effList)
+		if err != nil {
+			return errorResult("validation failed", err)
+		}
+		if n, err := strconv.ParseInt(destList, 10, 64); err == nil {
+			payload.ListID = &n
+		}
 		if n, err := strconv.ParseInt(taskID, 10, 64); err == nil {
 			payload.CopyTask = n
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		task, err := c.CopyTask(tctx, projectID, todolistID, taskID, payload)
+		task, err := c.CopyTask(tctx, projectID, effList, taskID, payload)
 		if err != nil {
 			return errorResult("copy task failed", err)
 		}
@@ -901,11 +1060,15 @@ func handleTaskCopy(client *proofhub.Client, projectID, todolistID string) serve
 	}
 }
 
-func handleTaskMove(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTaskMove(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -954,13 +1117,22 @@ func handleTaskMove(client *proofhub.Client, projectID, todolistID string) serve
 			b, _ := getOptionalBool(req, "completed")
 			payload.Completed = b
 		}
+		// Destination stays in the same project; new_todolist_id must be
+		// in the maintainable allowlist, defaulting to the source list.
+		destList, err := resolveNewTodolist(req, todolistIDs, effList)
+		if err != nil {
+			return errorResult("validation failed", err)
+		}
+		if n, err := strconv.ParseInt(destList, 10, 64); err == nil {
+			payload.ListID = &n
+		}
 		payload.MoveTask = true
 		if n, err := strconv.ParseInt(taskID, 10, 64); err == nil {
 			payload.ID = &n
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		task, err := c.MoveTask(tctx, projectID, todolistID, taskID, payload)
+		task, err := c.MoveTask(tctx, projectID, effList, taskID, payload)
 		if err != nil {
 			return errorResult("move task failed", err)
 		}
@@ -968,11 +1140,15 @@ func handleTaskMove(client *proofhub.Client, projectID, todolistID string) serve
 	}
 }
 
-func handleSubtaskList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleSubtaskList(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -983,7 +1159,7 @@ func handleSubtaskList(client *proofhub.Client, projectID, todolistID string) se
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		subs, err := c.ListSubtasks(tctx, projectID, todolistID, taskID)
+		subs, err := c.ListSubtasks(tctx, projectID, effList, taskID)
 		if err != nil {
 			return errorResult("list subtasks failed", err)
 		}
@@ -991,11 +1167,15 @@ func handleSubtaskList(client *proofhub.Client, projectID, todolistID string) se
 	}
 }
 
-func handleSubtaskGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleSubtaskGet(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1010,7 +1190,7 @@ func handleSubtaskGet(client *proofhub.Client, projectID, todolistID string) ser
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		sub, err := c.GetSubtask(tctx, projectID, todolistID, taskID, subtaskID)
+		sub, err := c.GetSubtask(tctx, projectID, effList, taskID, subtaskID)
 		if err != nil {
 			return errorResult("get subtask failed", err)
 		}
@@ -1018,11 +1198,15 @@ func handleSubtaskGet(client *proofhub.Client, projectID, todolistID string) ser
 	}
 }
 
-func handleSubtaskCreate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleSubtaskCreate(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1063,7 +1247,7 @@ func handleSubtaskCreate(client *proofhub.Client, projectID, todolistID string) 
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		sub, err := c.CreateSubtask(tctx, projectID, todolistID, taskID, payload)
+		sub, err := c.CreateSubtask(tctx, projectID, effList, taskID, payload)
 		if err != nil {
 			return errorResult("create subtask failed", err)
 		}
@@ -1071,11 +1255,15 @@ func handleSubtaskCreate(client *proofhub.Client, projectID, todolistID string) 
 	}
 }
 
-func handleSubtaskUpdate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleSubtaskUpdate(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1133,7 +1321,7 @@ func handleSubtaskUpdate(client *proofhub.Client, projectID, todolistID string) 
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		sub, err := c.UpdateSubtask(tctx, projectID, todolistID, taskID, subtaskID, payload)
+		sub, err := c.UpdateSubtask(tctx, projectID, effList, taskID, subtaskID, payload)
 		if err != nil {
 			return errorResult("update subtask failed", err)
 		}
@@ -1141,11 +1329,15 @@ func handleSubtaskUpdate(client *proofhub.Client, projectID, todolistID string) 
 	}
 }
 
-func handleSubtaskDelete(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleSubtaskDelete(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1160,18 +1352,22 @@ func handleSubtaskDelete(client *proofhub.Client, projectID, todolistID string) 
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		if err := c.DeleteSubtask(tctx, projectID, todolistID, taskID, subtaskID); err != nil {
+		if err := c.DeleteSubtask(tctx, projectID, effList, taskID, subtaskID); err != nil {
 			return errorResult("delete subtask failed", err)
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("deleted subtask %s", subtaskID)), nil
 	}
 }
 
-func handleCommentList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleCommentList(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1182,7 +1378,7 @@ func handleCommentList(client *proofhub.Client, projectID, todolistID string) se
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		comments, err := c.ListComments(tctx, projectID, todolistID, taskID)
+		comments, err := c.ListComments(tctx, projectID, effList, taskID)
 		if err != nil {
 			return errorResult("list comments failed", err)
 		}
@@ -1190,11 +1386,15 @@ func handleCommentList(client *proofhub.Client, projectID, todolistID string) se
 	}
 }
 
-func handleCommentGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleCommentGet(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1209,7 +1409,7 @@ func handleCommentGet(client *proofhub.Client, projectID, todolistID string) ser
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		cc, err := c.GetComment(tctx, projectID, todolistID, taskID, commentID)
+		cc, err := c.GetComment(tctx, projectID, effList, taskID, commentID)
 		if err != nil {
 			return errorResult("get comment failed", err)
 		}
@@ -1217,11 +1417,15 @@ func handleCommentGet(client *proofhub.Client, projectID, todolistID string) ser
 	}
 }
 
-func handleCommentCreate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleCommentCreate(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1239,7 +1443,7 @@ func handleCommentCreate(client *proofhub.Client, projectID, todolistID string) 
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		cc, err := c.CreateComment(tctx, projectID, todolistID, taskID, desc)
+		cc, err := c.CreateComment(tctx, projectID, effList, taskID, desc)
 		if err != nil {
 			return errorResult("create comment failed", err)
 		}
@@ -1247,11 +1451,15 @@ func handleCommentCreate(client *proofhub.Client, projectID, todolistID string) 
 	}
 }
 
-func handleCommentUpdate(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleCommentUpdate(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1273,7 +1481,7 @@ func handleCommentUpdate(client *proofhub.Client, projectID, todolistID string) 
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		cc, err := c.UpdateComment(tctx, projectID, todolistID, taskID, commentID, desc)
+		cc, err := c.UpdateComment(tctx, projectID, effList, taskID, commentID, desc)
 		if err != nil {
 			return errorResult("update comment failed", err)
 		}
@@ -1281,11 +1489,15 @@ func handleCommentUpdate(client *proofhub.Client, projectID, todolistID string) 
 	}
 }
 
-func handleCommentDelete(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleCommentDelete(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1300,18 +1512,22 @@ func handleCommentDelete(client *proofhub.Client, projectID, todolistID string) 
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		if err := c.DeleteComment(tctx, projectID, todolistID, taskID, commentID); err != nil {
+		if err := c.DeleteComment(tctx, projectID, effList, taskID, commentID); err != nil {
 			return errorResult("delete comment failed", err)
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("deleted comment %s", commentID)), nil
 	}
 }
 
-func handleHistoryList(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleHistoryList(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1322,7 +1538,7 @@ func handleHistoryList(client *proofhub.Client, projectID, todolistID string) se
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		h, err := c.ListTaskHistory(tctx, projectID, todolistID, taskID)
+		h, err := c.ListTaskHistory(tctx, projectID, effList, taskID)
 		if err != nil {
 			return errorResult("list history failed", err)
 		}
@@ -1330,11 +1546,15 @@ func handleHistoryList(client *proofhub.Client, projectID, todolistID string) se
 	}
 }
 
-func handleHistoryGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleHistoryGet(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
 			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
 		}
 		taskID, err := req.RequireString("task_id")
 		if err != nil {
@@ -1349,7 +1569,7 @@ func handleHistoryGet(client *proofhub.Client, projectID, todolistID string) ser
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		d, err := c.GetTaskHistoryDetail(tctx, projectID, todolistID, taskID, historyID)
+		d, err := c.GetTaskHistoryDetail(tctx, projectID, effList, taskID, historyID)
 		if err != nil {
 			return errorResult("get history detail failed", err)
 		}
@@ -1357,7 +1577,27 @@ func handleHistoryGet(client *proofhub.Client, projectID, todolistID string) ser
 	}
 }
 
-func handleTodolistGet(client *proofhub.Client, projectID, todolistID string) server.ToolHandlerFunc {
+func handleTodolistGet(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		c, err := mustClient(client)
+		if err != nil {
+			return errorResult("client not configured", err)
+		}
+		effList, err := resolveTodolist(req, todolistIDs)
+		if err != nil {
+			return errorResult("validation failed", err)
+		}
+		tctx, cancel := withTimeout(ctx)
+		defer cancel()
+		tl, err := c.GetTodolist(tctx, projectID, effList)
+		if err != nil {
+			return errorResult("get todolist failed", err)
+		}
+		return jsonResult(tl)
+	}
+}
+
+func handleTodolistList(client *proofhub.Client, projectID string, todolistIDs []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		c, err := mustClient(client)
 		if err != nil {
@@ -1365,11 +1605,18 @@ func handleTodolistGet(client *proofhub.Client, projectID, todolistID string) se
 		}
 		tctx, cancel := withTimeout(ctx)
 		defer cancel()
-		tl, err := c.GetTodolist(tctx, projectID, todolistID)
+		lists, err := c.ListTodolists(tctx, projectID)
 		if err != nil {
-			return errorResult("get todolist failed", err)
+			return errorResult("list todolists failed", err)
 		}
-		return jsonResult(tl)
+		// Only the ENV-configured lists are maintainable; surface those.
+		keep := make([]proofhub.Todolist, 0, len(lists))
+		for _, l := range lists {
+			if isAllowedTodolist(strconv.FormatInt(l.ID, 10), todolistIDs) {
+				keep = append(keep, l)
+			}
+		}
+		return jsonResult(keep)
 	}
 }
 

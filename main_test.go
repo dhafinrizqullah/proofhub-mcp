@@ -81,76 +81,87 @@ func TestValidateConfig(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: &config{
-				baseURL:    "https://example.proofhub.com",
-				apiKey:     "secret",
-				userAgent:  "proofhub-mcp (test@example.com)",
-				projectID:  "8213786200",
-				todolistID: "271478716253",
+				baseURL:     "https://example.proofhub.com",
+				apiKey:      "secret",
+				userAgent:   "proofhub-mcp (test@example.com)",
+				projectID:   "8213786200",
+				todolistIDs: []string{"271478716253"},
 			},
 		},
 		{
 			name: "missing base_url",
 			cfg: &config{
-				baseURL:    "",
-				apiKey:     "secret",
-				userAgent:  "proofhub-mcp (test@example.com)",
-				projectID:  "1",
-				todolistID: "1",
+				baseURL:     "",
+				apiKey:      "secret",
+				userAgent:   "proofhub-mcp (test@example.com)",
+				projectID:   "1",
+				todolistIDs: []string{"1"},
 			},
 			wantErr: "proofhub_base_url is required",
 		},
 		{
 			name: "missing api_key",
 			cfg: &config{
-				baseURL:    "https://example.com",
-				apiKey:     "",
-				userAgent:  "proofhub-mcp (test@example.com)",
-				projectID:  "1",
-				todolistID: "1",
+				baseURL:     "https://example.com",
+				apiKey:      "",
+				userAgent:   "proofhub-mcp (test@example.com)",
+				projectID:   "1",
+				todolistIDs: []string{"1"},
 			},
 			wantErr: "proofhub_api_key is required",
 		},
 		{
 			name: "missing project_id",
 			cfg: &config{
-				baseURL:    "https://example.com",
-				apiKey:     "k",
-				userAgent:  "proofhub-mcp (test@example.com)",
-				projectID:  "",
-				todolistID: "1",
+				baseURL:     "https://example.com",
+				apiKey:      "k",
+				userAgent:   "proofhub-mcp (test@example.com)",
+				projectID:   "",
+				todolistIDs: []string{"1"},
 			},
 			wantErr: "proofhub_project_id",
 		},
 		{
 			name: "invalid project_id non-digits",
 			cfg: &config{
-				baseURL:    "https://example.com",
-				apiKey:     "k",
-				userAgent:  "proofhub-mcp (test@example.com)",
-				projectID:  "abc",
-				todolistID: "1",
+				baseURL:     "https://example.com",
+				apiKey:      "k",
+				userAgent:   "proofhub-mcp (test@example.com)",
+				projectID:   "abc",
+				todolistIDs: []string{"1"},
 			},
 			wantErr: "proofhub_project_id",
 		},
 		{
-			name: "invalid todolist_id non-digits",
+			name: "invalid todolist_ids non-digits",
 			cfg: &config{
-				baseURL:    "https://example.com",
-				apiKey:     "k",
-				userAgent:  "proofhub-mcp (test@example.com)",
-				projectID:  "1",
-				todolistID: "12a",
+				baseURL:     "https://example.com",
+				apiKey:      "k",
+				userAgent:   "proofhub-mcp (test@example.com)",
+				projectID:   "1",
+				todolistIDs: []string{"12a"},
 			},
-			wantErr: "proofhub_todolist_id",
+			wantErr: "proofhub_todolist_ids",
+		},
+		{
+			name: "missing todolist_ids",
+			cfg: &config{
+				baseURL:     "https://example.com",
+				apiKey:      "k",
+				userAgent:   "proofhub-mcp (test@example.com)",
+				projectID:   "1",
+				todolistIDs: nil,
+			},
+			wantErr: "proofhub_todolist_ids",
 		},
 		{
 			name: "invalid user_agent format",
 			cfg: &config{
-				baseURL:    "https://example.com",
-				apiKey:     "k",
-				userAgent:  "bad-agent",
-				projectID:  "1",
-				todolistID: "1",
+				baseURL:     "https://example.com",
+				apiKey:      "k",
+				userAgent:   "bad-agent",
+				projectID:   "1",
+				todolistIDs: []string{"1"},
 			},
 			wantErr: "user-agent must look like",
 		},
@@ -183,27 +194,56 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "defaults from env",
 			env: map[string]string{
-				"PROOFHUB_BASE_URL":    "https://example.com",
-				"PROOFHUB_API_KEY":     "k",
-				"PROOFHUB_PROJECT_ID":  "1",
-				"PROOFHUB_TODOLIST_ID": "2",
+				"PROOFHUB_BASE_URL":     "https://example.com",
+				"PROOFHUB_API_KEY":      "k",
+				"PROOFHUB_PROJECT_ID":   "1",
+				"PROOFHUB_TODOLIST_IDS": "2,3",
+				"PROOFHUB_TODOLIST_ID":  "",
 			},
 			expected: &config{
-				baseURL:    "https://example.com",
-				projectID:  "1",
-				todolistID: "2",
-				transport:  "stdio",
-				httpPort:   "8080",
+				baseURL:     "https://example.com",
+				projectID:   "1",
+				todolistIDs: []string{"2", "3"},
+				transport:   "stdio",
+				httpPort:    "8080",
 			},
+		},
+		{
+			name: "legacy single todolist id",
+			env: map[string]string{
+				"PROOFHUB_BASE_URL":     "https://example.com",
+				"PROOFHUB_API_KEY":      "k",
+				"PROOFHUB_PROJECT_ID":   "1",
+				"PROOFHUB_TODOLIST_IDS": "",
+				"PROOFHUB_TODOLIST_ID":  "2",
+			},
+			expected: &config{
+				baseURL:     "https://example.com",
+				projectID:   "1",
+				todolistIDs: []string{"2"},
+				transport:   "stdio",
+				httpPort:    "8080",
+			},
+		},
+		{
+			name: "invalid todolist ids",
+			env: map[string]string{
+				"PROOFHUB_BASE_URL":     "https://example.com",
+				"PROOFHUB_API_KEY":      "k",
+				"PROOFHUB_PROJECT_ID":   "1",
+				"PROOFHUB_TODOLIST_IDS": "2,abc",
+				"PROOFHUB_TODOLIST_ID":  "",
+			},
+			wantErr: true,
 		},
 		{
 			name: "transport flag overrides env",
 			env: map[string]string{
-				"PROOFHUB_BASE_URL":    "https://example.com",
-				"PROOFHUB_API_KEY":     "k",
-				"PROOFHUB_PROJECT_ID":  "1",
-				"PROOFHUB_TODOLIST_ID": "2",
-				"MCP_TRANSPORT":        "stdio",
+				"PROOFHUB_BASE_URL":     "https://example.com",
+				"PROOFHUB_API_KEY":      "k",
+				"PROOFHUB_PROJECT_ID":   "1",
+				"PROOFHUB_TODOLIST_IDS": "2",
+				"MCP_TRANSPORT":         "stdio",
 			},
 			args: []string{"--transport", "http", "--http-port", "9090"},
 			expected: &config{
@@ -214,22 +254,22 @@ func TestLoadConfig(t *testing.T) {
 		{
 			name: "invalid transport",
 			env: map[string]string{
-				"PROOFHUB_BASE_URL":    "https://example.com",
-				"PROOFHUB_API_KEY":     "k",
-				"PROOFHUB_PROJECT_ID":  "1",
-				"PROOFHUB_TODOLIST_ID": "2",
-				"MCP_TRANSPORT":        "invalid",
+				"PROOFHUB_BASE_URL":     "https://example.com",
+				"PROOFHUB_API_KEY":      "k",
+				"PROOFHUB_PROJECT_ID":   "1",
+				"PROOFHUB_TODOLIST_IDS": "2",
+				"MCP_TRANSPORT":         "invalid",
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid http port",
 			env: map[string]string{
-				"PROOFHUB_BASE_URL":    "https://example.com",
-				"PROOFHUB_API_KEY":     "k",
-				"PROOFHUB_PROJECT_ID":  "1",
-				"PROOFHUB_TODOLIST_ID": "2",
-				"MCP_HTTP_PORT":        "not-a-port",
+				"PROOFHUB_BASE_URL":     "https://example.com",
+				"PROOFHUB_API_KEY":      "k",
+				"PROOFHUB_PROJECT_ID":   "1",
+				"PROOFHUB_TODOLIST_IDS": "2",
+				"MCP_HTTP_PORT":         "not-a-port",
 			},
 			wantErr: true,
 		},
@@ -241,6 +281,12 @@ func TestLoadConfig(t *testing.T) {
 			}
 			if _, ok := tt.env["MCP_TRANSPORT"]; !ok {
 				t.Setenv("MCP_TRANSPORT", "")
+			}
+			if _, ok := tt.env["PROOFHUB_TODOLIST_IDS"]; !ok {
+				t.Setenv("PROOFHUB_TODOLIST_IDS", "")
+			}
+			if _, ok := tt.env["PROOFHUB_TODOLIST_ID"]; !ok {
+				t.Setenv("PROOFHUB_TODOLIST_ID", "")
 			}
 			if _, ok := tt.env["MCP_HTTP_PORT"]; !ok {
 				t.Setenv("MCP_HTTP_PORT", "")
@@ -260,39 +306,46 @@ func TestLoadConfig(t *testing.T) {
 			if tt.expected.httpPort != "" {
 				assert.Equal(t, tt.expected.httpPort, cfg.httpPort)
 			}
+			if tt.expected.todolistIDs != nil {
+				assert.Equal(t, tt.expected.todolistIDs, cfg.todolistIDs)
+			}
 		})
 	}
 }
 
-// TestToolRegistration verifies 24 scoped tools and descriptions.
+// TestToolRegistration verifies 26 tools default to ENV with optional overrides.
 func TestToolRegistration(t *testing.T) {
 	t.Parallel()
 	s := server.NewMCPServer("test", "test", server.WithRecovery())
 	dummyClient := proofhub.New("https://example.com", "dummy", "proofhub-mcp (test@example.com)")
-	registerTools(s, dummyClient, "1", "2")
+	registerTools(s, dummyClient, "1", []string{"2"})
 
 	allTools := []mcp.Tool{
 		newTaskListTool(), newTaskGetTool(), newTaskCreateTool(), newTaskUpdateTool(), newTaskDeleteTool(), newTaskCopyTool(), newTaskMoveTool(),
 		newSubtaskListTool(), newSubtaskGetTool(), newSubtaskCreateTool(), newSubtaskUpdateTool(), newSubtaskDeleteTool(),
 		newCommentListTool(), newCommentGetTool(), newCommentCreateTool(), newCommentUpdateTool(), newCommentDeleteTool(),
 		newHistoryListTool(), newHistoryGetTool(),
-		newTodolistGetTool(), newLabelListTool(), newLabelGetTool(), newTimesheetListTool(), newTimesheetGetTool(),
+		newTodolistGetTool(), newTodolistListTool(), newLabelListTool(), newLabelGetTool(), newTimesheetListTool(), newTimesheetGetTool(),
 		newPeopleListTool(),
 	}
-	assert.Len(t, allTools, 25, "should have 25 tools (7+5+5+2+1+2+2+1)")
+	assert.Len(t, allTools, 26, "should have 26 tools (7+5+5+2+2+2+2+1)")
 
 	tests := []struct {
-		name            string
-		tool            mcp.Tool
-		expectNoProject bool
+		name              string
+		tool              mcp.Tool
+		expectScopeFields []string
 	}{
-		{name: "task_list", tool: newTaskListTool(), expectNoProject: true},
-		{name: "task_get", tool: newTaskGetTool(), expectNoProject: true},
-		{name: "task_create", tool: newTaskCreateTool(), expectNoProject: true},
-		{name: "todolist_get", tool: newTodolistGetTool(), expectNoProject: true},
-		{name: "label_list", tool: newLabelListTool(), expectNoProject: true},
-		{name: "timesheet_list", tool: newTimesheetListTool(), expectNoProject: true},
-		{name: "timesheet_get", tool: newTimesheetGetTool(), expectNoProject: true},
+		{name: "task_list", tool: newTaskListTool(), expectScopeFields: []string{"todolist_id"}},
+		{name: "task_get", tool: newTaskGetTool(), expectScopeFields: []string{"todolist_id"}},
+		{name: "task_create", tool: newTaskCreateTool(), expectScopeFields: []string{"todolist_id"}},
+		{name: "task_copy", tool: newTaskCopyTool(), expectScopeFields: []string{"todolist_id", "new_todolist_id"}},
+		{name: "task_move", tool: newTaskMoveTool(), expectScopeFields: []string{"todolist_id", "new_todolist_id"}},
+		{name: "todolist_get", tool: newTodolistGetTool(), expectScopeFields: []string{"todolist_id"}},
+		{name: "todolist_list", tool: newTodolistListTool(), expectScopeFields: nil},
+		{name: "timesheet_list", tool: newTimesheetListTool(), expectScopeFields: nil},
+		{name: "timesheet_get", tool: newTimesheetGetTool(), expectScopeFields: nil},
+		{name: "label_list", tool: newLabelListTool(), expectScopeFields: nil},
+		{name: "people_list", tool: newPeopleListTool(), expectScopeFields: nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -300,16 +353,120 @@ func TestToolRegistration(t *testing.T) {
 			is := assert.New(t)
 			is.Equal(tt.name, tt.tool.Name)
 			is.NotEmpty(tt.tool.Description, "description must not be empty")
-			if tt.expectNoProject {
-				schemaBytes, _ := json.Marshal(tt.tool.InputSchema)
-				schemaStr := string(schemaBytes)
-				is.NotContains(schemaStr, "project_id", "scoped tool should not expose project_id")
-				if tt.name != "label_list" && tt.name != "label_get" {
-					hasScope := strings.Contains(strings.ToLower(tt.tool.Description), "scoped") ||
-						strings.Contains(strings.ToLower(tt.tool.Description), "env")
-					is.True(hasScope, "description should mention scoped/ENV for %s: got %q", tt.name, tt.tool.Description)
-				}
+			schemaBytes, _ := json.Marshal(tt.tool.InputSchema)
+			schemaStr := string(schemaBytes)
+			for _, field := range tt.expectScopeFields {
+				is.Contains(schemaStr, field, "tool %s should expose %s", tt.name, field)
 			}
+			if len(tt.expectScopeFields) == 0 {
+				is.NotContains(schemaStr, "project_id", "global tool should not expose project_id")
+				is.NotContains(schemaStr, "todolist_id", "global tool should not expose todolist_id")
+			} else {
+				desc := strings.ToLower(tt.tool.Description)
+				hasScope := strings.Contains(desc, "env") ||
+					strings.Contains(desc, "default") ||
+					strings.Contains(desc, "maintainable")
+				is.True(hasScope, "description should mention scope for %s: got %q", tt.name, tt.tool.Description)
+			}
+		})
+	}
+}
+
+// TestParseTodolistIDs covers allowlist parsing.
+func TestParseTodolistIDs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		raw      string
+		expected []string
+		wantErr  bool
+	}{
+		{name: "single id", raw: "2714", expected: []string{"2714"}},
+		{name: "comma-separated", raw: "2714,2720,2731", expected: []string{"2714", "2720", "2731"}},
+		{name: "spaces trimmed", raw: " 2714 , 2720 ", expected: []string{"2714", "2720"}},
+		{name: "deduplicated", raw: "2714,2714,2720", expected: []string{"2714", "2720"}},
+		{name: "empty entries skipped", raw: "2714,,2720,", expected: []string{"2714", "2720"}},
+		{name: "empty raw", raw: "", wantErr: true},
+		{name: "only commas", raw: " , ,", wantErr: true},
+		{name: "non-digits", raw: "2714,abc", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			is := assert.New(t)
+			got, err := parseTodolistIDs(tt.raw)
+			if tt.wantErr {
+				is.Error(err)
+				return
+			}
+			is.NoError(err)
+			is.Equal(tt.expected, got)
+		})
+	}
+}
+
+// TestResolveTodolist covers allowlist enforcement and single-list default.
+func TestResolveTodolist(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		args    map[string]any
+		allowed []string
+		want    string
+		wantErr string
+	}{
+		{name: "single list default", args: map[string]any{}, allowed: []string{"2"}, want: "2"},
+		{name: "explicit allowed", args: map[string]any{"todolist_id": "3"}, allowed: []string{"2", "3"}, want: "3"},
+		{name: "multi requires todolist_id", args: map[string]any{}, allowed: []string{"2", "3"}, wantErr: "todolist_id is required"},
+		{name: "not maintainable", args: map[string]any{"todolist_id": "9"}, allowed: []string{"2", "3"}, wantErr: "not maintainable"},
+		{name: "non-digits", args: map[string]any{"todolist_id": "12a"}, allowed: []string{"2", "3"}, wantErr: "want numeric id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			is := assert.New(t)
+			req := newCallRequest(tt.args)
+			got, err := resolveTodolist(req, tt.allowed)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				is.Contains(err.Error(), tt.wantErr)
+				return
+			}
+			is.NoError(err)
+			is.Equal(tt.want, got)
+		})
+	}
+}
+
+// TestResolveNewTodolist covers copy/move destinations inside the allowlist.
+func TestResolveNewTodolist(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		args    map[string]any
+		allowed []string
+		source  string
+		want    string
+		wantErr string
+	}{
+		{name: "default same as source", args: map[string]any{}, allowed: []string{"2", "3"}, source: "2", want: "2"},
+		{name: "cross-list destination", args: map[string]any{"new_todolist_id": "3"}, allowed: []string{"2", "3"}, source: "2", want: "3"},
+		{name: "destination not maintainable", args: map[string]any{"new_todolist_id": "9"}, allowed: []string{"2", "3"}, source: "2", wantErr: "not maintainable"},
+		{name: "destination non-digits", args: map[string]any{"new_todolist_id": "x"}, allowed: []string{"2", "3"}, source: "2", wantErr: "want numeric id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			is := assert.New(t)
+			req := newCallRequest(tt.args)
+			got, err := resolveNewTodolist(req, tt.allowed, tt.source)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				is.Contains(err.Error(), tt.wantErr)
+				return
+			}
+			is.NoError(err)
+			is.Equal(tt.want, got)
 		})
 	}
 }
@@ -408,7 +565,7 @@ func TestHandleTaskList_Success(t *testing.T) {
 	defer srv.Close()
 	client := proofhub.New(srv.URL, "k", "App (a@b.com)")
 	client.HTTP = srv.Client()
-	handler := handleTaskList(client, "1", "2")
+	handler := handleTaskList(client, "1", []string{"2"})
 	req := newCallRequest(map[string]any{})
 	result, err := handler(context.Background(), req)
 	require.NoError(t, err)
@@ -440,7 +597,7 @@ func TestHandleTaskGet_Validation(t *testing.T) {
 			} else {
 				client = proofhub.New("https://example.com", "k", "App (a@b.com)")
 			}
-			h := handleTaskGet(client, "1", "2")
+			h := handleTaskGet(client, "1", []string{"2"})
 			req := newCallRequest(tt.args)
 			result, err := h(context.Background(), req)
 			require.NoError(t, err)
@@ -459,12 +616,101 @@ func TestHandleTodolistGet_Scoped(t *testing.T) {
 	defer srv.Close()
 	client := proofhub.New(srv.URL, "k", "App (a@b.com)")
 	client.HTTP = srv.Client()
-	h := handleTodolistGet(client, "1", "2")
+	h := handleTodolistGet(client, "1", []string{"2"})
 	req := newCallRequest(map[string]any{})
 	result, err := h(context.Background(), req)
 	require.NoError(t, err)
 	assert.False(t, result.IsError)
 	assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "My List")
+}
+
+func TestHandleTaskList_MultiRequiresTodolist(t *testing.T) {
+	t.Parallel()
+	client := proofhub.New("https://example.com", "k", "App (a@b.com)")
+	h := handleTaskList(client, "1", []string{"2", "3"})
+	req := newCallRequest(map[string]any{})
+	result, err := h(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "todolist_id is required")
+}
+
+func TestHandleTaskList_RejectsUnlisted(t *testing.T) {
+	t.Parallel()
+	client := proofhub.New("https://example.com", "k", "App (a@b.com)")
+	h := handleTaskList(client, "1", []string{"2", "3"})
+	req := newCallRequest(map[string]any{"todolist_id": "9"})
+	result, err := h(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "not maintainable")
+}
+
+func TestHandleTaskList_OverrideSuccess(t *testing.T) {
+	t.Parallel()
+	srv := newMockProofHubServer(t, "/api/v3/projects/1/todolists/3/tasks", `[{"id":123,"title":"hello"}]`)
+	defer srv.Close()
+	client := proofhub.New(srv.URL, "k", "App (a@b.com)")
+	client.HTTP = srv.Client()
+	h := handleTaskList(client, "1", []string{"2", "3"})
+	req := newCallRequest(map[string]any{"todolist_id": "3"})
+	result, err := h(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.IsError)
+	assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "hello")
+}
+
+func TestHandleTodolistList_FiltersAllowed(t *testing.T) {
+	t.Parallel()
+	srv := newMockProofHubServer(t, "/api/v3/projects/1/todolists", `[{"id":2,"title":"Keep"},{"id":9,"title":"Drop"}]`)
+	defer srv.Close()
+	client := proofhub.New(srv.URL, "k", "App (a@b.com)")
+	client.HTTP = srv.Client()
+	h := handleTodolistList(client, "1", []string{"2"})
+	req := newCallRequest(map[string]any{})
+	result, err := h(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.IsError)
+	text := result.Content[0].(mcp.TextContent).Text
+	assert.Contains(t, text, "Keep")
+	assert.NotContains(t, text, "Drop")
+}
+
+func TestHandleTaskCopy_CrossListDestination(t *testing.T) {
+	t.Parallel()
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v3/projects/1/todolists/2/tasks/123", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotBody))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":124,"title":"copy"}`))
+	}))
+	defer srv.Close()
+	client := proofhub.New(srv.URL, "k", "App (a@b.com)")
+	client.HTTP = srv.Client()
+	h := handleTaskCopy(client, "1", []string{"2", "3"})
+	req := newCallRequest(map[string]any{"task_id": "123", "todolist_id": "2", "new_todolist_id": "3"})
+	result, err := h(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.IsError)
+	assert.Equal(t, float64(3), gotBody["list_id"])
+}
+
+func TestHandleTaskCopy_RejectsUnlistedDestination(t *testing.T) {
+	t.Parallel()
+	client := proofhub.New("https://example.com", "k", "App (a@b.com)")
+	h := handleTaskCopy(client, "1", []string{"2", "3"})
+	req := newCallRequest(map[string]any{"task_id": "123", "todolist_id": "2", "new_todolist_id": "9"})
+	result, err := h(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content[0].(mcp.TextContent).Text, "not maintainable")
 }
 
 func newMockProofHubServer(t *testing.T, expectedPath, response string) *httptest.Server {

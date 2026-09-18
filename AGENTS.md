@@ -19,17 +19,18 @@ Instructions for AI agents working in this repository. Follow this to avoid brea
   - Then `golang-testing` + `golang-stretchr-testify` for tests, `golang-context` for timeouts, `golang-error-handling` for `%w`, `golang-code-style`/`golang-naming` for style, `golang-security` for secrets/input.
 - After change: `go vet ./... && go test ./... -race && go build -o /tmp/proofhub-mcp .`
 
-## Single-todolist scope (CRITICAL — do not break)
+## Strict ENV scope: 1 project + allowlisted lists (CRITICAL — do not break)
 
-- This MCP is **scoped to one todolist only** via ENV:
+- This MCP is **locked to one project** with a **maintainable todolist allowlist**, both from ENV — nothing escapes it:
   ```bash
-  PROOFHUB_PROJECT_ID=8213786200   # digits only
-  PROOFHUB_TODOLIST_ID=271478716253 # digits only
+  PROOFHUB_PROJECT_ID=8213786200          # digits only
+  PROOFHUB_TODOLIST_IDS=2714,2720,2731    # comma-separated allowlist (legacy PROOFHUB_TODOLIST_ID = one list)
   ```
-- `main.go:loadConfig` + `validateConfig` fail-fast at startup if missing/invalid (lowercase error, no secret leak: `proofhub_project_id is required and must be digits, got ""`).
-- **All 24 tools have NO `project_id`/`todolist_id` in input schema** — they are injected from ENV in handlers (`registerTools(s, client, projectID, todolistID)` → `handleTaskList(client, projectID, todolistID)`). Do NOT re-add those params.
-- `task_copy`/`task_move` intentionally do NOT allow `new_project_id`/`new_todolist_id` — they stay inside the same todolist (single-scope). Do not expose destination project/list.
-- `todolist_get` has **no input** (read-only ENV todolist). `timesheet_list`/`timesheet_get` inject `projectID` from ENV; `label_list`/`label_get` are global (no project).
+- `main.go:loadConfig` (`parseTodolistIDs`) + `validateConfig` fail-fast at startup if missing/invalid (lowercase error, no secret leak: `proofhub_project_id is required and must be digits, got ""`).
+- **No tool exposes `project_id`** — the project is fixed via ENV and injected in handlers (`registerTools(s, client, projectID, todolistIDs)` → `handleTaskList(client, projectID, todolistIDs)`). Do NOT add project params.
+- Scoped tools take `todolist_id`, resolved via `resolveTodolist`: must be in the ENV allowlist; omit only when one list is configured (multi without it errors listing maintainable IDs).
+- `task_copy`/`task_move` take `new_todolist_id` destination via `resolveNewTodolist` (same project, allowlist-enforced, defaults to source). Do NOT add cross-project destinations.
+- `todolist_list` has **no input** and returns only the allowlisted lists. `timesheet_list`/`timesheet_get` inject `projectID` from ENV; `label_list`/`label_get`/`people_list` are global (no project).
 
 ## ProofHub API v3 handling (must preserve)
 
@@ -49,7 +50,7 @@ Ref: `pkg/proofhub/*.go` — Docs `https://github.com/ProofHub/api_v3`.
 
 ```
 proofhub-mcp/
-├── main.go              # MCP server, ENV/config, 24 tools, stdio + Streamable HTTP
+├── main.go              # MCP server, ENV/config, 26 tools, stdio + Streamable HTTP
 ├── main_test.go         # Unit tests for helpers, config, tool registration (table-driven, testify)
 ├── pkg/proofhub/
 │   ├── client.go        # Core Client, Validate, do, retry, backoff, truncate (268 lines)
@@ -74,20 +75,20 @@ proofhub-mcp/
 - Keep imports minimal per file (no unused imports).
 - Keep all code/comments/README in **English**.
 
-## Tools (24) — descriptions must match README
+## Tools (26) — descriptions must match README
 
-All `mcp.NewTool(WithDescription("..."))` in `main.go:383` must exactly match `README.md` table `| Tool | Description | ... |`.
+All `mcp.NewTool(WithDescription("..."))` in `main.go` must exactly match `README.md` table `| Tool | Description | ... |`.
 
 | Category | Tools |
 |---|---|
-| Tasks (7) | `task_list` (no input), `task_get` (`task_id`), `task_create` (`title`+...), `task_update` (`task_id`+...), `task_delete`/`task_copy`/`task_move` (`task_id`) |
-| Subtasks (5) | `subtask_list` (`task_id`), `subtask_get`/`subtask_update`/`subtask_delete` (`task_id`+`subtask_id`), `subtask_create` (`task_id`+`title`) |
-| Comments (5) | `comment_list` (`task_id`), `comment_get`/`comment_update`/`comment_delete` (`task_id`+`comment_id`), `comment_create` (`task_id`+`description`) |
-| History (2) | `history_list` (`task_id`), `history_get` (`task_id`+`history_id`) |
-| Meta (5) | `todolist_get` (-), `label_list` (-), `label_get` (`label_id`), `timesheet_list` (-), `timesheet_get` (`timesheet_id`) |
+| Tasks (7) | `task_list` (`todolist_id`), `task_get`/`task_update`/`task_delete` (`task_id`+`todolist_id`), `task_create` (`title`+`todolist_id`), `task_copy`/`task_move` (`task_id`+`todolist_id`+`new_todolist_id`) |
+| Subtasks (5) | `subtask_list` (`task_id`+`todolist_id`), `subtask_get`/`subtask_update`/`subtask_delete` (`task_id`+`subtask_id`+`todolist_id`), `subtask_create` (`task_id`+`title`+`todolist_id`) |
+| Comments (5) | `comment_list` (`task_id`+`todolist_id`), `comment_get`/`comment_update`/`comment_delete` (`task_id`+`comment_id`+`todolist_id`), `comment_create` (`task_id`+`description`+`todolist_id`) |
+| History (2) | `history_list` (`task_id`+`todolist_id`), `history_get` (`task_id`+`history_id`+`todolist_id`) |
+| Meta (7) | `todolist_get` (`todolist_id`), `todolist_list` (-), `label_list` (-), `label_get` (`label_id`), `timesheet_list` (-), `timesheet_get` (`timesheet_id`), `people_list` (-) |
 
-- Input validation: `isDigits` (`^[0-9]+$`), `YYYY-MM-DD` (`time.Parse`), `required` per schema.
-- Do NOT add `project_id`/`todolist_id` to any tool — scoped via ENV.
+- Input validation: `isDigits` (`^[0-9]+$`), `YYYY-MM-DD` (`time.Parse`), `required` per schema, allowlist via `resolveTodolist`/`resolveNewTodolist`.
+- Do NOT add `project_id` to any tool — project is fixed via ENV and cannot be escaped. `todolist_id` must be allowlisted (omit only with one configured list).
 
 ## Transports
 
@@ -130,8 +131,9 @@ ENTRYPOINT ["/bin/proofhub-mcp"]
 ## Common pitfalls (do NOT do)
 
 - ❌ Reading `.env` or echoing `PROOFHUB_API_KEY`.
-- ❌ Adding `project_id`/`todolist_id` to tool inputs (breaks scope).
-- ❌ Exposing todolist management (create/list/delete todolists) — only `todolist_get` is allowed.
+- ❌ Adding `project_id` to tool inputs (breaks strict single-project scope).
+- ❌ Accepting a `todolist_id` outside the ENV allowlist — always resolve via `resolveTodolist`/`resolveNewTodolist`; the allowlist is never skipped.
+- ❌ Exposing todolist management (create/delete todolists) — only `todolist_get` + allowlist-filtered `todolist_list` are allowed.
 - ❌ Using Indonesian in README/code/comments (must be English).
 - ❌ Merging `pkg/proofhub/*.go` back into one file.
 - ❌ Forgetting `context.WithTimeout` or `%w` wrapping.
@@ -145,7 +147,7 @@ ENTRYPOINT ["/bin/proofhub-mcp"]
 go vet ./... && go test ./... -race
 go build -o /tmp/proofhub-mcp . && docker build -t proofhub-mcp:local .
 # stdio
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | PROOFHUB_BASE_URL=https://example.com PROOFHUB_API_KEY=dummy PROOFHUB_USER_AGENT="proofhub-mcp (test@example.com)" PROOFHUB_PROJECT_ID=1 PROOFHUB_TODOLIST_ID=1 ./proofhub-mcp
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | PROOFHUB_BASE_URL=https://example.com PROOFHUB_API_KEY=dummy PROOFHUB_USER_AGENT="proofhub-mcp (test@example.com)" PROOFHUB_PROJECT_ID=1 PROOFHUB_TODOLIST_IDS=1 ./proofhub-mcp
 # http
-MCP_TRANSPORT=http MCP_HTTP_PORT=8080 PROOFHUB_BASE_URL=https://example.com PROOFHUB_API_KEY=dummy PROOFHUB_USER_AGENT="proofhub-mcp (test@example.com)" PROOFHUB_PROJECT_ID=1 PROOFHUB_TODOLIST_ID=1 ./proofhub-mcp & curl http://localhost:8080/health
+MCP_TRANSPORT=http MCP_HTTP_PORT=8080 PROOFHUB_BASE_URL=https://example.com PROOFHUB_API_KEY=dummy PROOFHUB_USER_AGENT="proofhub-mcp (test@example.com)" PROOFHUB_PROJECT_ID=1 PROOFHUB_TODOLIST_IDS=1 ./proofhub-mcp & curl http://localhost:8080/health
 ```
