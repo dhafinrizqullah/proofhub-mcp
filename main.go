@@ -1040,9 +1040,13 @@ func handleTaskCopy(client *proofhub.Client, projectID string, todolistIDs []str
 		}
 		// Destination stays in the same project; new_todolist_id must be
 		// in the maintainable allowlist, defaulting to the source list.
+		// ProofHub expects explicit project + list_id (see api_v3 tasks.md).
 		destList, err := resolveNewTodolist(req, todolistIDs, effList)
 		if err != nil {
 			return errorResult("validation failed", err)
+		}
+		if n, err := strconv.ParseInt(projectID, 10, 64); err == nil {
+			payload.Project = &n
 		}
 		if n, err := strconv.ParseInt(destList, 10, 64); err == nil {
 			payload.ListID = &n
@@ -1119,9 +1123,13 @@ func handleTaskMove(client *proofhub.Client, projectID string, todolistIDs []str
 		}
 		// Destination stays in the same project; new_todolist_id must be
 		// in the maintainable allowlist, defaulting to the source list.
+		// ProofHub expects explicit project + list_id (see api_v3 tasks.md).
 		destList, err := resolveNewTodolist(req, todolistIDs, effList)
 		if err != nil {
 			return errorResult("validation failed", err)
+		}
+		if n, err := strconv.ParseInt(projectID, 10, 64); err == nil {
+			payload.Project = &n
 		}
 		if n, err := strconv.ParseInt(destList, 10, 64); err == nil {
 			payload.ListID = &n
