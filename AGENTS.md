@@ -38,7 +38,7 @@ Ref: `pkg/proofhub/*.go` — Docs `https://github.com/ProofHub/api_v3`.
 
 | Requirement | Implementation | Where |
 |---|---|---|
-| **JSON** — `Content-Type: application/json` on POST/PUT, 415 on invalid | `json.Marshal` + `Content-Type` header only when body != nil, `Accept: application/json` always | `client.go:182,211` |
+| **JSON** — `Content-Type: application/json` always (ProofHub answers 200 + `INCOMPLETE HEADERS` without it, even on bodyless DELETE), `Accept: application/json` always | `Content-Type` + `Accept` set on every request | `client.go:209` |
 | **User-Agent** — `AppName (email)`, 400 if missing | `userAgentPattern` `^.+\s\(.+@.+\)$`, `Validate()` fail-fast, default `proofhub-mcp (dev@example.com)`, set on every request | `client.go:84,87,210` `main.go:130` |
 | **Rate limit** — 429, 25 req/10s, `Retry-After` (seconds or HTTP-date) | `retryableStatus` includes 429, `parseRetryAfter` handles seconds + HTTP-date, capped at 60s, `sleepCtx` respects `ctx` | `client.go:126,148,165,239` |
 | **Retry 5xx** — 500/502/503/504 retry after backoff | `retryableStatus` includes 500/502/503/504, `backoff` 1s→2s→4s capped 15s, `MaxRetries=3`, `WithMaxRetries(0)` to opt-out (POST duplicate risk noted) | `client.go:126,138,252` |

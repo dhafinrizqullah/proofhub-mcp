@@ -208,6 +208,23 @@ func TestDo_Success(t *testing.T) {
 	assert.Contains(t, string(body), "ok")
 }
 
+func TestDo_SendsContentTypeOnBodylessDelete(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodDelete, r.Method)
+		// ProofHub answers 200 + INCOMPLETE HEADERS without it, even with no body.
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "k", "App (a@b.com)")
+	c.HTTP = srv.Client()
+	_, code, err := c.do(context.Background(), http.MethodDelete, "/test", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 204, code)
+}
+
 func TestDo_RetryOn429ThenSuccess(t *testing.T) {
 	t.Parallel()
 	calls := 0

@@ -209,9 +209,10 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 		req.Header.Set("X-API-KEY", c.APIKey)
 		req.Header.Set("User-Agent", c.UserAgent)
 		req.Header.Set("Accept", "application/json")
-		if body != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
+		// ProofHub answers 200 + {"success":false,"message":"INCOMPLETE HEADERS"}
+		// when Content-Type is missing — even on bodyless DELETE — so send it
+		// on every request, not just POST/PUT.
+		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := httpc.Do(req)
 		if err != nil {
@@ -265,4 +266,3 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
-
